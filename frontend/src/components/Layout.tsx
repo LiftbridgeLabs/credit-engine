@@ -1,5 +1,5 @@
 import { Link, Outlet, useNavigate } from "react-router-dom";
-import { Clapperboard, LogOut, Settings } from "lucide-react";
+import { Clapperboard, LogOut, ScrollText, Settings2, User } from "lucide-react";
 import { useAuth } from "../lib/auth";
 import { Button } from "./ui";
 
@@ -22,12 +22,26 @@ export default function Layout() {
           CreditEngine
         </Link>
         <div className="flex items-center gap-3">
+          <Link
+            to="/logs"
+            className="text-sm text-slate-500 hover:text-brand-600 dark:hover:text-brand-400 hidden sm:flex items-center gap-1.5"
+          >
+            <ScrollText className="h-3.5 w-3.5" />
+            Logs
+          </Link>
+          <Link
+            to="/settings"
+            className="text-sm text-slate-500 hover:text-brand-600 dark:hover:text-brand-400 hidden sm:flex items-center gap-1.5"
+          >
+            <Settings2 className="h-3.5 w-3.5" />
+            Settings
+          </Link>
           {me && (
             <Link
               to="/account"
               className="text-sm text-slate-500 hover:text-brand-600 dark:hover:text-brand-400 hidden sm:flex items-center gap-1.5"
             >
-              <Settings className="h-3.5 w-3.5" />
+              <User className="h-3.5 w-3.5" />
               {me.plex_username ?? me.email}
             </Link>
           )}

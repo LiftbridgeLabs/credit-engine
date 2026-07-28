@@ -78,6 +78,11 @@ export default function ScansTab({ serverId }: { serverId: number }) {
             history of every time that happened, whether you queued it here, a rule or batch triggered it, or it
             fired automatically when someone started watching. Check here if you want to confirm a scan actually
             worked.
+            <span className="block mt-1 text-xs text-slate-400">
+              Three ways to trigger one manually: this button (pick from a search-and-browse list, runs
+              immediately), the Libraries tab (browse and scan while looking at the item itself), or a Batch
+              (save a named list to reuse or run on a schedule, instead of one-off).
+            </span>
           </p>
           <Button icon={<Plus className="h-4 w-4" />} onClick={() => setPicking(true)} disabled={submitting}>
             Queue a scan

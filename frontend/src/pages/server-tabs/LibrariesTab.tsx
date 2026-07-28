@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { RefreshCw, Film, Tv, Music, FolderOpen, Info } from "lucide-react";
 import { api, ApiError, type Library } from "../../lib/api";
 import { Badge, Button, Card, ErrorBanner, Spinner, Toggle } from "../../components/ui";
 import { EmptyState } from "../../components/EmptyState";
-import LibraryBrowser from "./LibraryBrowser";
 
 const TYPE_ICON = { movie: Film, show: Tv, artist: Music } as const;
 
@@ -11,7 +11,6 @@ export default function LibrariesTab({ serverId }: { serverId: number }) {
   const [libraries, setLibraries] = useState<Library[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
-  const [browsingId, setBrowsingId] = useState<number | null>(null);
 
   async function load() {
     try {
@@ -55,7 +54,8 @@ export default function LibrariesTab({ serverId }: { serverId: number }) {
           <Info className="h-4 w-4 mt-0.5 shrink-0" />
           <span>
             "Included" libraries are available for rules and batches to target — separate from
-            credits-control protection, which covers every library on the server.
+            credits-control protection, which covers every library on the server. "Open" below takes you
+            to that library's dashboard — credits status, filtering, and scanning.
           </span>
         </div>
         <Button variant="secondary" icon={<RefreshCw className={`h-3.5 w-3.5 ${syncing ? "animate-spin" : ""}`} />} onClick={sync} disabled={syncing} className="shrink-0">
@@ -101,13 +101,11 @@ export default function LibrariesTab({ serverId }: { serverId: number }) {
                 </div>
                 <div className="flex gap-2 shrink-0">
                   {(lib.type === "show" || lib.type === "movie") && (
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      onClick={() => setBrowsingId(browsingId === lib.id ? null : lib.id)}
-                    >
-                      {browsingId === lib.id ? "Hide" : "Browse"}
-                    </Button>
+                    <Link to={`/servers/${serverId}/libraries/${lib.section_id}`}>
+                      <Button size="sm" variant="secondary">
+                        Open
+                      </Button>
+                    </Link>
                   )}
                   <div className="flex items-center gap-2">
                     <span className="text-xs text-slate-500 hidden sm:inline">Included</span>
@@ -115,7 +113,6 @@ export default function LibrariesTab({ serverId }: { serverId: number }) {
                   </div>
                 </div>
               </div>
-              {browsingId === lib.id && <LibraryBrowser serverId={serverId} sectionId={lib.section_id} />}
             </Card>
           );
         })}

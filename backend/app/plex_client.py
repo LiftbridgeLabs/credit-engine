@@ -174,6 +174,37 @@ def disable_item_credits(item) -> bool:
         return False
 
 
+def check_has_credits(plex: PlexServer, rating_key: int) -> bool:
+    """Whether Plex has already generated a credits marker for this item — true per-item concept,
+    works for any leaf video (movie or episode). The one part of syncing that can't be answered
+    from a bulk listing: Plex only exposes markers via a full per-item fetch, never inline in bulk
+    results (confirmed empirically — bulk requests with includeMarkers=1 still come back with zero
+    Marker elements), so this is a real network round trip per item, meant to be run in parallel
+    across many items rather than called in a loop."""
+    item = plex.fetchItem(rating_key)
+    return any(m.type == "credits" for m in (item.markers or []))
+
+
+def check_credits_enabled(item) -> bool | None:
+    """Whether generation is currently allowed by this item's own per-item override. Only
+    Movie/Show/Season expose this preference — Episode does not, because Plex's own credits
+    generation setting only ever applies at the show (or movie) level, never per individual
+    episode; this app has only ever set/read it at that granularity too (see enable_item_credits).
+    Callers checking an episode's status should use its parent show's value instead of calling this
+    on the episode itself, which would raise.
+
+    None if the item doesn't expose the preference at all (some movies, depending on metadata
+    agent) — genuinely unknown, not "disabled". Takes an already-fetched item, not a rating key —
+    unlike check_has_credits, this is cheap enough (no extra round trip; the preference call is the
+    expensive part, already being paid for) to call on objects you already have in hand from a bulk
+    listing."""
+    try:
+        pref = item.preference("enableCreditsMarkerGeneration")
+        return pref.value != 0 if pref else None
+    except NotFound:
+        return None
+
+
 def get_global_credits_behavior(plex: PlexServer) -> str:
     """One of 'never', 'scheduled', 'asap' — the server-wide gate. 'never' blocks even explicit
     per-item Analyze calls; anything else also enables Plex's own automatic Butler sweep."""
@@ -249,6 +280,20 @@ def browse_children(plex: PlexServer, rating_key: int):
     if item.type == "show":
         return item.seasons()
     if item.type == "season":
+        return item.episodes()
+    return []
+
+
+def browse_all_episodes(plex: PlexServer, rating_key: int):
+    """Every episode under a show or season, flattened — one Plex API call either way (plexapi's
+    .episodes() hits Plex's "all leaves" endpoint directly rather than us walking seasons one by one).
+
+    This is the safe way to offer "add this whole season/show" as a bulk-pick convenience: each
+    episode still becomes its own individual scan target, so Plex's per-item analyze() is only ever
+    called on leaf items — never on the season/show rating key itself, which is what would cascade
+    into an uncontrolled full-show sweep (see the leaf-only guardrail in tasks.py/scans.py)."""
+    item = plex.fetchItem(rating_key)
+    if item.type in ("show", "season"):
         return item.episodes()
     return []
 

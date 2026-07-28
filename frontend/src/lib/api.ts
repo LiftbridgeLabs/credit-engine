@@ -1,7 +1,12 @@
-// Prefer an explicit build-time override; otherwise derive from whatever host the browser is
-// actually using. A hardcoded "localhost" would break the moment this is opened from another
-// device on the LAN (phone, tablet) — "localhost" there means the device itself, not this server.
-const API_BASE = import.meta.env.VITE_API_BASE_URL || `${window.location.protocol}//${window.location.hostname}:8000`;
+// The frontend is served by the same container/origin as the API (FastAPI serves the built SPA
+// directly — see backend/app/main.py) — so a relative path is correct by default, and works
+// unchanged behind a reverse proxy at any domain, with no build-time URL to get wrong. Only
+// needed as a real URL when frontend and backend genuinely run on different hosts (e.g. the
+// Vite dev server during local frontend development, talking to a separately-running backend).
+//
+// Every backend route lives under /api (see main.py) — baked in here once so every existing
+// api.get("/servers") style call across the app is already correct without touching each one.
+const API_BASE = (import.meta.env.VITE_API_BASE_URL || "") + "/api";
 
 export function getApiBase(): string {
   return API_BASE;
@@ -166,6 +171,28 @@ export interface BrowseItem {
   index: number | null;
   season_number: number | null;
   has_children: boolean;
+  has_thumb: boolean;
+  // Null = genuinely unknown (no sync has ever run against this library yet), not "false".
+  credits_enabled: boolean | null;
+  has_credits: boolean | null;
+  // Only populated on "show" rows, from a per-library rollup computed at browse time.
+  episode_count: number | null;
+  episodes_with_credits: number | null;
+}
+
+export interface LibraryStats {
+  top_level_count: number;
+  total_items: number;
+  has_credits: number;
+  pending: number;
+  missing: number;
+}
+
+// The thumb endpoint is hit from plain <img> tags, which can't send an Authorization header — the
+// session token goes as a query param instead (see get_current_user_via_query on the backend).
+// Never embeds the Plex token itself; that stays server-side.
+export function thumbUrl(serverId: number, ratingKey: number): string {
+  return `${getApiBase()}/servers/${serverId}/browse/${ratingKey}/thumb?auth=${encodeURIComponent(getToken() ?? "")}`;
 }
 
 export interface Diagnostics {
@@ -173,4 +200,21 @@ export interface Diagnostics {
   butler_task_enabled: boolean;
   butler_window: { start_hour: number; end_hour: number };
   libraries: { section_id: number; title: string; credits_detection_enabled: boolean }[];
+}
+
+export type LogLevel = "DEBUG" | "INFO" | "WARNING" | "ERROR" | "CRITICAL";
+
+export interface LogEntry {
+  id: number;
+  created_at: string;
+  level: LogLevel;
+  logger_name: string;
+  message: string;
+  server_id: number | null;
+}
+
+export interface AppSettings {
+  id: number;
+  log_max_entries: number;
+  log_retention_days: number;
 }

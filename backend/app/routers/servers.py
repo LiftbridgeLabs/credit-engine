@@ -7,8 +7,9 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.models import ServerConnection, User
 from app.plex_client import connect, get_diagnostics, set_global_credits_behavior
+from app.routers.libraries import sync_libraries_now
 from app.security import get_current_user
-from app.tasks import bootstrap_credits_control
+from app.tasks import bootstrap_credits_control, sync_library_contents
 
 router = APIRouter(prefix="/servers", tags=["servers"])
 
@@ -29,7 +30,7 @@ def link_server(
     """Attach a Plex server to this account — either a connection picked from /auth/plex/servers,
     or a manually-entered base_url/token for users who skip Plex login entirely."""
     try:
-        connect(body.base_url, body.token)
+        plex = connect(body.base_url, body.token)
     except Exception as exc:  # noqa: BLE001 — surface whatever plexapi/requests raised as a 400
         raise HTTPException(status_code=400, detail=f"Couldn't reach that server: {exc}")
 
@@ -44,6 +45,14 @@ def link_server(
     db.add(server)
     db.commit()
     db.refresh(server)
+
+    # Best-effort — the server is already linked either way; the Libraries tab's own Sync button
+    # is still there if this fails for some reason (transient network blip right after linking).
+    try:
+        sync_libraries_now(plex, server.id, db)
+    except Exception:  # noqa: BLE001
+        pass
+
     return server
 
 
@@ -116,3 +125,13 @@ def disable_credits_control(server_id: int, current_user: User = Depends(get_cur
     server.credits_control_enabled = False
     db.commit()
     return {"status": "disabled"}
+
+
+@router.post("/{server_id}/sync-content")
+def sync_content(server_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Snapshots every included library's structure (titles, ordering, thumb availability) so
+    browsing doesn't have to hit Plex live every time. Manual only for now — runs in the background,
+    can take a while on a large library, same pattern as the credits-control bootstrap."""
+    server = _get_owned_server(server_id, current_user, db)
+    sync_library_contents.delay(server_id)
+    return {"status": "sync_started"}

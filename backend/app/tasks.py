@@ -1,3 +1,5 @@
+import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 from croniter import croniter
@@ -5,10 +7,22 @@ from sqlalchemy.orm import Session
 
 from app.celery_app import celery_app
 from app.db import SessionLocal
-from app.models import Library, ScanBatch, ScanJob, ScanRule, ScanStatus, ServerConnection
+from app.models import (
+    AppSettings,
+    CachedItem,
+    LogEntry,
+    Library,
+    ScanBatch,
+    ScanJob,
+    ScanRule,
+    ScanStatus,
+    ServerConnection,
+)
 from app.plex_client import (
     analyze_item,
     apply_credits_rule,
+    check_credits_enabled,
+    check_has_credits,
     connect,
     describe_item,
     disable_item_credits,
@@ -19,6 +33,14 @@ from app.plex_client import (
     iter_all_sections,
     set_global_credits_behavior,
 )
+
+# Credits-status checks are one Plex round trip per movie/episode (see check_credits_status) —
+# parallelized so a sync doesn't take literal hours on a large library. Kept modest rather than
+# maximized: this is extra concurrent load on top of whatever else is already hitting the same
+# Plex server (playback, other scans), and Plex itself has to serve every one of these requests.
+_CREDITS_CHECK_WORKERS = 8
+
+logger = logging.getLogger(__name__)
 
 
 def _is_due(schedule_cron: str, last_run_at: datetime | None, now: datetime) -> bool:
@@ -61,6 +83,7 @@ def run_scan_job(scan_job_id: int) -> None:
             job.status = ScanStatus.failed
             job.error = "Server connection no longer exists"
             db.commit()
+            logger.error("Scan job %s failed: server connection no longer exists", scan_job_id)
             return
 
         try:
@@ -75,9 +98,21 @@ def run_scan_job(scan_job_id: int) -> None:
                 raise ValueError(f"{item.type} isn't a movie or episode — refusing to avoid a full-show scan")
             analyze_item(item)
             job.status = ScanStatus.complete
+            logger.info(
+                "Scan complete: %s (rating key %s)",
+                job.title,
+                job.rating_key,
+                extra={"server_id": job.server_id},
+            )
         except Exception as exc:  # noqa: BLE001 — persist whatever Plex/plexapi raises
             job.status = ScanStatus.failed
             job.error = str(exc)
+            logger.error(
+                "Scan failed: rating key %s — %s",
+                job.rating_key,
+                exc,
+                extra={"server_id": job.server_id},
+            )
         finally:
             job.completed_at = datetime.now(timezone.utc)
             db.commit()
@@ -107,10 +142,20 @@ def apply_rule_job(rule_id: int) -> None:
             return
 
         plex = connect(server.base_url, server.token)
-        apply_credits_rule(plex, section_keys, rule.criteria)
+        result = apply_credits_rule(plex, section_keys, rule.criteria)
 
         rule.last_run_at = datetime.now(timezone.utc)
         db.commit()
+
+        titles = ", ".join(result["enabled"]) if result["enabled"] else "none"
+        logger.info(
+            'Rule "%s" applied: enabled %d, disabled %d — enabled: %s',
+            rule.name,
+            len(result["enabled"]),
+            result["disabled_count"],
+            titles,
+            extra={"server_id": rule.server_id},
+        )
     finally:
         db.close()
 
@@ -127,11 +172,14 @@ def bootstrap_credits_control(server_id: int) -> None:
             return
 
         started_at = datetime.now(timezone.utc)
+        logger.info("Bootstrap started for %s", server.name, extra={"server_id": server_id})
         plex = connect(server.base_url, server.token)
 
+        touched = 0
         skipped = 0
         for section in iter_all_sections(plex):
             for item in section.all():
+                touched += 1
                 try:
                     if not disable_item_credits(item):
                         skipped += 1
@@ -140,7 +188,13 @@ def bootstrap_credits_control(server_id: int) -> None:
                     # this item isn't "new", so it's simply left at the library default going forward.
                     skipped += 1
         if skipped:
-            print(f"bootstrap_credits_control: skipped {skipped} items that couldn't be set")
+            logger.warning(
+                "Bootstrap for %s: skipped %d of %d items that couldn't be set",
+                server.name,
+                skipped,
+                touched,
+                extra={"server_id": server_id},
+            )
 
         set_global_credits_behavior(plex, "scheduled")
 
@@ -150,6 +204,16 @@ def bootstrap_credits_control(server_id: int) -> None:
         # backdating the checkpoint to the start ensures reconciliation catches it on the next pass.
         server.last_new_item_check_at = started_at
         db.commit()
+
+        elapsed = (server.credits_control_bootstrapped_at - started_at).total_seconds()
+        logger.info(
+            "Bootstrap complete for %s: %d items touched, %d skipped, %.0fs",
+            server.name,
+            touched,
+            skipped,
+            elapsed,
+            extra={"server_id": server_id},
+        )
     finally:
         db.close()
 
@@ -169,12 +233,21 @@ def reconcile_new_items() -> None:
                 continue
 
             plex = connect(server.base_url, server.token)
+            found = 0
             for section in iter_all_sections(plex):
                 for item in find_items_added_since(section, since):
                     disable_item_credits(item)
+                    found += 1
 
             server.last_new_item_check_at = now
             db.commit()
+            if found:
+                logger.info(
+                    "Reconciliation for %s: disabled %d newly-added item(s) that missed the webhook",
+                    server.name,
+                    found,
+                    extra={"server_id": server.id},
+                )
     finally:
         db.close()
 
@@ -204,9 +277,22 @@ def handle_import_webhook(self, server_id: int, payload: dict) -> None:
         plex = connect(server.base_url, server.token)
         item = find_item_by_title_and_guid(plex, section_type, title, guid_fragment)
         if item is None:
+            if self.request.retries >= self.max_retries:
+                logger.warning(
+                    'Import webhook: gave up matching "%s" after %d retries — reconcile_new_items '
+                    "will catch it eventually if it's actually in Plex",
+                    title,
+                    self.max_retries,
+                    extra={"server_id": server_id},
+                )
             raise self.retry(countdown=30)
 
         disable_item_credits(item)
+        logger.info(
+            'Import webhook: disabled credits for "%s" (new from Sonarr/Radarr)',
+            title,
+            extra={"server_id": server_id},
+        )
     finally:
         db.close()
 
@@ -234,6 +320,12 @@ def handle_plex_scrobble(server_id: int, rating_key: int) -> None:
             server_id=server_id, section_id=item.librarySectionID, included=True
         ).first()
         if library is None:
+            logger.debug(
+                "Scrobble for %s ignored: library %s isn't included",
+                describe_item(item),
+                item.librarySectionID,
+                extra={"server_id": server_id},
+            )
             return
 
         if item.type == "episode":
@@ -253,6 +345,13 @@ def handle_plex_scrobble(server_id: int, rating_key: int) -> None:
             job_ids.append(job.id)
         db.commit()
 
+        logger.info(
+            "Watch event: %s — queued %d scan(s) (lookahead %d)",
+            describe_item(item),
+            len(job_ids),
+            server.scrobble_lookahead_episodes,
+            extra={"server_id": server_id},
+        )
         for job_id in job_ids:
             run_scan_job.delay(job_id)
     finally:
@@ -281,5 +380,188 @@ def check_scheduled_batches() -> None:
         for batch in batches:
             if _is_due(batch.schedule_cron, batch.last_run_at, now):
                 queue_batch_scan(db, batch)
+    finally:
+        db.close()
+
+
+@celery_app.task(name="app.tasks.prune_logs")
+def prune_logs() -> None:
+    """Two independent triggers, whichever fires prunes the oldest rows: age (log_retention_days)
+    and a row-count cap (log_max_entries, the practical stand-in for "max size" — see AppSettings).
+    Runs on a timer (celery_app.py beat_schedule) rather than after every write, since checking on
+    every single log call would mean a COUNT query per log line."""
+    db = SessionLocal()
+    try:
+        cfg = db.get(AppSettings, 1)
+        if cfg is None:
+            cfg = AppSettings(id=1)
+            db.add(cfg)
+            db.commit()
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=cfg.log_retention_days)
+        deleted_by_age = (
+            db.query(LogEntry).filter(LogEntry.created_at < cutoff).delete(synchronize_session=False)
+        )
+
+        deleted_by_size = 0
+        total = db.query(LogEntry).count()
+        if total > cfg.log_max_entries:
+            excess = total - cfg.log_max_entries
+            # id is monotonic and indexed (primary key) — cheaper to order by than created_at.
+            cutoff_id = db.query(LogEntry.id).order_by(LogEntry.id.asc()).offset(excess - 1).limit(1).scalar()
+            if cutoff_id is not None:
+                deleted_by_size = (
+                    db.query(LogEntry).filter(LogEntry.id <= cutoff_id).delete(synchronize_session=False)
+                )
+
+        db.commit()
+        if deleted_by_age or deleted_by_size:
+            logger.debug(
+                "Log pruning: removed %d (past %d days), %d (over %d-row cap)",
+                deleted_by_age,
+                cfg.log_retention_days,
+                deleted_by_size,
+                cfg.log_max_entries,
+            )
+    finally:
+        db.close()
+
+
+@celery_app.task(name="app.tasks.sync_library_contents")
+def sync_library_contents(server_id: int) -> None:
+    """Snapshots every included library's structure into CachedItem so browsing doesn't have to hit
+    Plex live every time — triggered manually (the "Sync" button on the Servers page), not automatic.
+
+    Uses flat, type-filtered section queries (all shows, all seasons, all episodes, each in one Plex
+    API call) rather than walking show -> season -> episode one at a time, which would be an N+1
+    round trip per level on a large library.
+
+    Also checks each item's real credits status against Plex directly — this is what lets a fresh
+    deployment (a brand new database, no prior history) correctly rediscover credits that were
+    already generated before this database ever existed, instead of showing everything as
+    "missing." Two different, genuinely N+1 checks, both parallelized across a thread pool:
+    credits_enabled (only Movie/Show expose this preference — Episode does not, since Plex's own
+    generation setting is per-show, never per-episode, so an episode's value is just copied from
+    its parent show rather than checked again) and has_credits (a true per-episode/movie fact,
+    checked directly on every leaf item)."""
+    db = SessionLocal()
+    try:
+        server = db.get(ServerConnection, server_id)
+        if server is None:
+            return
+
+        plex = connect(server.base_url, server.token)
+        libraries = db.query(Library).filter_by(server_id=server_id, included=True).all()
+        if not libraries:
+            logger.warning("Library sync requested for %s but no libraries are included", server.name, extra={"server_id": server_id})
+            return
+
+        total = 0
+        for lib in libraries:
+            section = plex.library.sectionByID(lib.section_id)
+            # Clear this library's old snapshot first — simpler and safer than upserting stale rows
+            # for items that were removed/renamed since the last sync.
+            db.query(CachedItem).filter_by(server_id=server_id, section_id=lib.section_id).delete()
+
+            rows = []
+            if section.type == "movie":
+                movies = list(section.all())
+                logger.info("Checking credits status for %d movie(s) in %s...", len(movies), lib.title, extra={"server_id": server_id})
+
+                def _check_movie(m) -> CachedItem:
+                    enabled = check_credits_enabled(m)
+                    try:
+                        has_credits = check_has_credits(plex, m.ratingKey)
+                    except Exception:  # noqa: BLE001 — one bad item shouldn't abort the whole sync
+                        has_credits = False
+                    return CachedItem(
+                        server_id=server_id,
+                        section_id=lib.section_id,
+                        rating_key=m.ratingKey,
+                        parent_rating_key=None,
+                        title=m.title,
+                        type="movie",
+                        has_thumb=bool(getattr(m, "thumb", None)),
+                        credits_enabled=enabled,
+                        has_credits=has_credits,
+                    )
+
+                with ThreadPoolExecutor(max_workers=_CREDITS_CHECK_WORKERS) as pool:
+                    rows.extend(pool.map(_check_movie, movies))
+
+            elif section.type == "show":
+                shows = list(section.all(libtype="show"))
+                logger.info("Checking credits status for %d show(s) in %s...", len(shows), lib.title, extra={"server_id": server_id})
+
+                # Cheap relative to the episode pass below — one preference read per show, no
+                # per-episode equivalent since Episode doesn't expose the preference at all.
+                with ThreadPoolExecutor(max_workers=_CREDITS_CHECK_WORKERS) as pool:
+                    show_enabled = dict(zip((s.ratingKey for s in shows), pool.map(check_credits_enabled, shows)))
+
+                for s in shows:
+                    rows.append(
+                        CachedItem(
+                            server_id=server_id,
+                            section_id=lib.section_id,
+                            rating_key=s.ratingKey,
+                            parent_rating_key=None,
+                            title=s.title,
+                            type="show",
+                            has_thumb=bool(getattr(s, "thumb", None)),
+                            credits_enabled=show_enabled.get(s.ratingKey),
+                        )
+                    )
+                for se in section.all(libtype="season"):
+                    rows.append(
+                        CachedItem(
+                            server_id=server_id,
+                            section_id=lib.section_id,
+                            rating_key=se.ratingKey,
+                            parent_rating_key=se.parentRatingKey,
+                            title=se.title,
+                            type="season",
+                            index=se.index,
+                            season_number=se.index,
+                            has_thumb=bool(getattr(se, "thumb", None)),
+                            credits_enabled=show_enabled.get(se.parentRatingKey),
+                        )
+                    )
+
+                episodes = list(section.all(libtype="episode"))
+                logger.info("Checking credits status for %d episode(s) in %s...", len(episodes), lib.title, extra={"server_id": server_id})
+
+                def _episode_has_credits(ep) -> bool:
+                    try:
+                        return check_has_credits(plex, ep.ratingKey)
+                    except Exception:  # noqa: BLE001
+                        return False
+
+                with ThreadPoolExecutor(max_workers=_CREDITS_CHECK_WORKERS) as pool:
+                    episode_credits = list(pool.map(_episode_has_credits, episodes))
+
+                for ep, has_credits in zip(episodes, episode_credits):
+                    rows.append(
+                        CachedItem(
+                            server_id=server_id,
+                            section_id=lib.section_id,
+                            rating_key=ep.ratingKey,
+                            parent_rating_key=ep.parentRatingKey,
+                            show_rating_key=ep.grandparentRatingKey,
+                            title=ep.title,
+                            type="episode",
+                            index=ep.index,
+                            season_number=ep.parentIndex,
+                            has_thumb=bool(getattr(ep, "thumb", None)),
+                            credits_enabled=show_enabled.get(ep.grandparentRatingKey),
+                            has_credits=has_credits,
+                        )
+                    )
+
+            db.add_all(rows)
+            lib.content_synced_at = datetime.now(timezone.utc)
+            total += len(rows)
+
+        db.commit()
+        logger.info("Library sync complete for %s: %d items cached", server.name, total, extra={"server_id": server_id})
     finally:
         db.close()

@@ -16,6 +16,29 @@ def _get_owned_server(server_id: int, current_user: User, db: Session) -> Server
     return server
 
 
+def sync_libraries_now(plex, server_id: int, db: Session) -> int:
+    """Shared with servers.link_server, which calls this right after linking so the Libraries tab
+    is already populated — no reason to make someone click Sync manually before they can even see
+    what's on the server they just linked."""
+    existing = {lib.section_id: lib for lib in db.query(Library).filter_by(server_id=server_id)}
+    seen_section_ids = set()
+
+    for section in plex.library.sections():
+        seen_section_ids.add(section.key)
+        if section.key in existing:
+            existing[section.key].title = section.title
+            existing[section.key].type = section.type
+        else:
+            db.add(Library(server_id=server_id, section_id=section.key, title=section.title, type=section.type))
+
+    for section_id, lib in existing.items():
+        if section_id not in seen_section_ids:
+            db.delete(lib)
+
+    db.commit()
+    return len(seen_section_ids)
+
+
 @router.post("/sync")
 def sync_libraries(
     server_id: int,
@@ -25,24 +48,7 @@ def sync_libraries(
     """Pull the current library list from Plex and upsert it locally."""
     server = _get_owned_server(server_id, current_user, db)
     plex = connect(server.base_url, server.token)
-
-    existing = {lib.section_id: lib for lib in db.query(Library).filter_by(server_id=server.id)}
-    seen_section_ids = set()
-
-    for section in plex.library.sections():
-        seen_section_ids.add(section.key)
-        if section.key in existing:
-            existing[section.key].title = section.title
-            existing[section.key].type = section.type
-        else:
-            db.add(Library(server_id=server.id, section_id=section.key, title=section.title, type=section.type))
-
-    for section_id, lib in existing.items():
-        if section_id not in seen_section_ids:
-            db.delete(lib)
-
-    db.commit()
-    return {"synced": len(seen_section_ids)}
+    return {"synced": sync_libraries_now(plex, server.id, db)}
 
 
 @router.get("")

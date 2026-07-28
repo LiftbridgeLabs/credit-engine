@@ -1,6 +1,9 @@
 from celery import Celery
 
 from app.config import settings
+from app.log_handler import install_log_handler
+
+install_log_handler()
 
 celery_app = Celery(
     "credit_engine",
@@ -27,6 +30,10 @@ celery_app.conf.update(
         "reconcile-new-items": {
             "task": "app.tasks.reconcile_new_items",
             "schedule": 120.0,
+        },
+        "prune-logs": {
+            "task": "app.tasks.prune_logs",
+            "schedule": 600.0,
         },
     },
 )

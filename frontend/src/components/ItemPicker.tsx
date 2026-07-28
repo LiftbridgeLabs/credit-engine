@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
-import { ChevronRight, ChevronDown, ChevronLeft, Search, Plus, Check } from "lucide-react";
+import { ChevronRight, ChevronDown, ChevronLeft, Search, Plus, Check, ListPlus } from "lucide-react";
 import { api, ApiError, type BrowseItem, type Library } from "../lib/api";
 import { Button, Input, Spinner } from "./ui";
+import { Thumb } from "./Thumb";
 import { PAGE_SIZES, getStoredPageSize, setStoredPageSize } from "../lib/pageSize";
 
 export interface PickedItem {
@@ -24,6 +25,8 @@ function PickerNode({
 }) {
   const [expanded, setExpanded] = useState(false);
   const [children, setChildren] = useState<BrowseItem[] | null>(null);
+  const [addingAll, setAddingAll] = useState(false);
+  const [addedCount, setAddedCount] = useState<number | null>(null);
 
   async function toggleExpand() {
     if (!expanded && children === null) {
@@ -36,12 +39,35 @@ function PickerNode({
     setExpanded(!expanded);
   }
 
+  async function addAllEpisodes() {
+    setAddingAll(true);
+    try {
+      const episodes = await api.get<BrowseItem[]>(`/servers/${serverId}/browse/${item.rating_key}/episodes`);
+      let added = 0;
+      for (const ep of episodes) {
+        if (!pickedKeys.has(ep.rating_key)) {
+          const epLabel = ep.index != null ? `E${ep.index} — ${ep.title}` : ep.title;
+          onPick({ rating_key: ep.rating_key, title: epLabel });
+          added++;
+        }
+      }
+      setAddedCount(added);
+    } catch {
+      // best-effort — the picker has no error surface of its own, the modal's own error banner
+      // (if any) isn't reachable from here, so just leave the button clickable to retry
+    } finally {
+      setAddingAll(false);
+    }
+  }
+
   const label = item.type === "episode" && item.index != null ? `E${item.index} — ${item.title}` : item.title;
   const picked = pickedKeys.has(item.rating_key);
   // Plex's analyze action cascades to every child of a show/season — picking one of those (instead
   // of a specific movie/episode) silently turns a targeted scan into a full-show sweep. Only leaf
-  // items are safe to queue directly; shows/seasons must be drilled into instead.
+  // items are safe to queue directly; a show/season instead gets "add every episode individually"
+  // below, which keeps each one as its own separate, safe scan target.
   const scannable = item.type === "movie" || item.type === "episode";
+  const isContainer = item.type === "show" || item.type === "season";
 
   return (
     <div style={{ marginLeft: depth * 18 }}>
@@ -56,6 +82,7 @@ function PickerNode({
         ) : (
           <span className="w-4 shrink-0" />
         )}
+        <Thumb serverId={serverId} ratingKey={item.rating_key} hasThumb={item.has_thumb} />
         <span className="text-sm flex-1 truncate text-slate-700 dark:text-slate-300">{label}</span>
         {scannable ? (
           <button
@@ -68,6 +95,16 @@ function PickerNode({
           >
             {picked ? <Check className="h-3 w-3" /> : <Plus className="h-3 w-3" />}
             {picked ? "Added" : "Add"}
+          </button>
+        ) : isContainer ? (
+          <button
+            onClick={addAllEpisodes}
+            disabled={addingAll}
+            className="shrink-0 flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-md transition-colors bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-brand-50 hover:text-brand-700 dark:hover:bg-brand-950 dark:hover:text-brand-300 disabled:opacity-60"
+            title="Adds every episode individually — still safe, one scan target per episode, never the whole show at once"
+          >
+            {addingAll ? <Spinner className="h-3 w-3" /> : <ListPlus className="h-3 w-3" />}
+            {addingAll ? "Adding…" : addedCount !== null ? `Added ${addedCount}` : "Add all episodes"}
           </button>
         ) : (
           <span className="shrink-0 text-xs text-slate-400 italic pr-1">pick an episode</span>

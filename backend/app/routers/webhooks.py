@@ -1,4 +1,5 @@
 import json
+import logging
 import secrets as secrets_module
 from datetime import datetime, timezone
 
@@ -8,6 +9,8 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.models import ServerConnection
 from app.tasks import handle_import_webhook, handle_plex_scrobble
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/servers/{server_id}/webhooks", tags=["webhooks"])
 
@@ -23,6 +26,7 @@ def receive_import_webhook(server_id: int, secret: str, payload: dict, db: Sessi
     if payload.get("eventType") == "Test":
         server.webhook_verified_at = datetime.now(timezone.utc)
         db.commit()
+        logger.info("Sonarr/Radarr webhook verified for %s", server.name, extra={"server_id": server_id})
         return {"status": "verified"}
 
     if not server.credits_control_enabled:

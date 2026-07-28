@@ -29,14 +29,9 @@ def create_session_token(user_id: int) -> str:
     return jwt.encode(payload, settings.secret_key, algorithm="HS256")
 
 
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
-    db: Session = Depends(get_db),
-) -> User:
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+def get_user_from_token(token: str, db: Session) -> User:
     try:
-        payload = jwt.decode(credentials.credentials, settings.secret_key, algorithms=["HS256"])
+        payload = jwt.decode(token, settings.secret_key, algorithms=["HS256"])
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired session")
 
@@ -44,3 +39,19 @@ def get_current_user(
     if user is None:
         raise HTTPException(status_code=401, detail="Invalid or expired session")
     return user
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    db: Session = Depends(get_db),
+) -> User:
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return get_user_from_token(credentials.credentials, db)
+
+
+def get_current_user_via_query(auth: str, db: Session = Depends(get_db)) -> User:
+    """Same session-token check as get_current_user, but reads it from a query param instead of the
+    Authorization header — for <img> tags, which can't set custom headers. Only used by the thumb
+    proxy endpoint; every other route stays on the header-based dependency."""
+    return get_user_from_token(auth, db)

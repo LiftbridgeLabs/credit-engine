@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -8,6 +9,8 @@ from app.db import get_db
 from app.models import Library, ScanRule, ServerConnection, User
 from app.plex_client import apply_credits_rule, connect
 from app.security import get_current_user
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/servers/{server_id}/rules", tags=["rules"])
 
@@ -117,5 +120,15 @@ def apply_rule(
 
     rule.last_run_at = datetime.now(timezone.utc)
     db.commit()
+
+    titles = ", ".join(result["enabled"]) if result["enabled"] else "none"
+    logger.info(
+        'Rule "%s" applied manually: enabled %d, disabled %d — enabled: %s',
+        rule.name,
+        len(result["enabled"]),
+        result["disabled_count"],
+        titles,
+        extra={"server_id": server_id},
+    )
 
     return {"enabled_count": len(result["enabled"]), "enabled_titles": result["enabled"], "disabled_count": result["disabled_count"]}

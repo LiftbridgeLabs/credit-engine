@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { Plus, Server, Webhook, ChevronDown, ChevronRight } from "lucide-react";
+import { Plus, RefreshCw, Server, Webhook, ChevronDown, ChevronRight } from "lucide-react";
 import { api, ApiError, type PlexDiscoveredServer, type PlexServerConnection, type ServerConnection } from "../lib/api";
 import { Badge, Button, Card, ErrorBanner, Input, Spinner } from "../components/ui";
 import { EmptyState } from "../components/EmptyState";
@@ -11,6 +11,8 @@ export default function ServersPage() {
   const [servers, setServers] = useState<ServerConnection[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [linking, setLinking] = useState(false);
+  const [syncing, setSyncing] = useState<Set<number>>(new Set());
+  const toast = useToast();
 
   async function load() {
     try {
@@ -23,6 +25,29 @@ export default function ServersPage() {
   useEffect(() => {
     load();
   }, []);
+
+  async function syncContent(e: React.MouseEvent, serverId: number) {
+    e.preventDefault(); // the card itself is a Link — don't navigate when clicking this button
+    e.stopPropagation();
+    setSyncing((prev) => new Set(prev).add(serverId));
+    try {
+      await api.post(`/servers/${serverId}/sync-content`);
+      toast("Library sync started — running in the background, can take a while on a large library");
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : "Failed to start sync");
+    } finally {
+      // Fire-and-forget — there's no fine-grained "done" signal to poll yet, so this just
+      // reflects "request sent", not "sync finished". Browsing gets faster once it actually
+      // completes; no other feedback in the meantime.
+      window.setTimeout(() => {
+        setSyncing((prev) => {
+          const next = new Set(prev);
+          next.delete(serverId);
+          return next;
+        });
+      }, 2000);
+    }
+  }
 
   return (
     <div className="space-y-6">
@@ -81,7 +106,7 @@ export default function ServersPage() {
                 <div className="min-w-0 flex-1">
                   <div className="font-medium text-slate-900 dark:text-white truncate">{s.name}</div>
                   <div className="text-xs text-slate-500 font-mono truncate">{s.base_url}</div>
-                  <div className="flex flex-wrap gap-1.5 mt-2.5">
+                  <div className="flex flex-wrap items-center gap-1.5 mt-2.5">
                     <Badge tone={s.credits_control_enabled ? "good" : "neutral"}>
                       {s.credits_control_enabled ? "Credits control on" : "Credits control off"}
                     </Badge>
@@ -89,6 +114,17 @@ export default function ServersPage() {
                       <Webhook className="h-3 w-3 mr-1" />
                       {s.webhook_verified_at ? "Webhook verified" : "Webhook unverified"}
                     </Badge>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      icon={<RefreshCw className={`h-3 w-3 ${syncing.has(s.id) ? "animate-spin" : ""}`} />}
+                      onClick={(e) => syncContent(e, s.id)}
+                      disabled={syncing.has(s.id)}
+                      className="ml-auto"
+                      title="Caches library titles/art references so Browse loads instantly instead of hitting Plex live every time"
+                    >
+                      Sync library
+                    </Button>
                   </div>
                 </div>
               </div>

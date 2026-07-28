@@ -1,7 +1,7 @@
 import enum
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, DateTime, Enum, ForeignKey, String, Boolean
+from sqlalchemy import JSON, DateTime, Enum, ForeignKey, Integer, String, Boolean, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -85,6 +85,9 @@ class Library(Base):
     title: Mapped[str] = mapped_column(String)
     type: Mapped[str] = mapped_column(String)  # "movie" | "show"
     included: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Null until the "Sync" button on the Servers page is used at least once — browse endpoints fall
+    # back to live Plex calls until then, so browsing still works, just without the cache's speed.
+    content_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     server: Mapped["ServerConnection"] = relationship(back_populates="libraries")
 
@@ -137,3 +140,72 @@ class ScanJob(Base):
     error: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class LogEntry(Base):
+    """One row per log record emitted anywhere in the app (FastAPI request handlers, Celery tasks,
+    the webhook receivers) via DatabaseLogHandler — see app/log_handler.py. Indexed on id (not
+    timestamp) for the live-tail viewer, which polls "give me everything after id N" rather than
+    re-fetching a timestamp range every couple seconds."""
+
+    __tablename__ = "log_entries"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
+    level: Mapped[str] = mapped_column(String, index=True)  # DEBUG | INFO | WARNING | ERROR | CRITICAL
+    logger_name: Mapped[str] = mapped_column(String)  # e.g. "app.tasks"
+    message: Mapped[str] = mapped_column(Text)
+    # Best-effort context, not a hard link — a server can be unlinked after the fact and the log
+    # entry should still be readable, so this is nullable and has no relationship/cascade.
+    server_id: Mapped[int | None] = mapped_column(ForeignKey("server_connections.id"), nullable=True)
+
+
+class CachedItem(Base):
+    """A lightweight snapshot of one item's position in the library tree (title, type, parent,
+    ordering) — populated by the manual "Sync" button on the Servers page (app/tasks.py's
+    sync_library_contents), not touched automatically. Deliberately just metadata, a few hundred
+    bytes a row even for a huge library — actual image bytes are never stored here or anywhere in
+    the DB; see the /thumb proxy endpoint, which streams straight from Plex on request instead."""
+
+    __tablename__ = "cached_items"
+    __table_args__ = (UniqueConstraint("server_id", "rating_key", name="uq_cached_item_server_rating_key"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    server_id: Mapped[int] = mapped_column(ForeignKey("server_connections.id"), index=True)
+    section_id: Mapped[int] = mapped_column(index=True)
+    rating_key: Mapped[int] = mapped_column(index=True)
+    # Null for top-level items (movies, shows) — the same field browse queries filter on to answer
+    # both "what's at the top of this library" (None) and "what's under rating key X" (= X).
+    parent_rating_key: Mapped[int | None] = mapped_column(nullable=True, index=True)
+    # Episodes only — the show's rating key directly (skipping the season in between), so per-show
+    # credits stats are a single GROUP BY instead of a two-hop join through seasons every time the
+    # dashboard loads.
+    show_rating_key: Mapped[int | None] = mapped_column(nullable=True, index=True)
+    title: Mapped[str] = mapped_column(String)
+    type: Mapped[str] = mapped_column(String)  # "movie" | "show" | "season" | "episode"
+    index: Mapped[int | None] = mapped_column(nullable=True)
+    season_number: Mapped[int | None] = mapped_column(nullable=True)
+    has_thumb: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Only meaningful for movie/episode (leaf) rows — the other two fields answering "will this
+    # ever get one" and "does it already have one," read straight from Plex at sync time rather
+    # than assumed from our own history. This is what lets re-linking a server (a fresh database,
+    # e.g. a new deployment) correctly rediscover credits that were already generated previously,
+    # instead of treating everything as untouched.
+    credits_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    has_credits: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+
+
+class AppSettings(Base):
+    """Single-row table (id is always 1) for app-wide settings that don't belong to any one server —
+    currently just log retention. A real settings table rather than env vars because these are meant
+    to be changed at runtime from the Settings page, not at container-start time."""
+
+    __tablename__ = "app_settings"
+
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    # Two independent triggers — whichever is hit first prunes the oldest rows. "Max size" is
+    # enforced as a row-count cap rather than a byte-size, since that's what's cheaply and reliably
+    # enforceable with a single DELETE ... ORDER BY id LIMIT query, and roughly tracks disk usage
+    # anyway since rows are similar sizes.
+    log_max_entries: Mapped[int] = mapped_column(Integer, default=50_000)
+    log_retention_days: Mapped[int] = mapped_column(Integer, default=30)

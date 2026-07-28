@@ -45,7 +45,8 @@ when someone starts watching.
    ```
 
 3. Open the UI at `http://<this-machine's-address>:5173` (e.g. `http://192.168.1.50:5173`).
-   Works from any device on your LAN — it auto-detects the backend at the same host, port 8000.
+   Works from any device on your LAN — the API is served from that same address/port, no separate
+   backend URL to configure.
 
 ## First run
 
@@ -66,7 +67,7 @@ when someone starts watching.
    - **Batches**: a fixed list of Plex rating keys, run on demand or on a schedule.
    - **The Plex webhook** (recommended for real day-to-day use): in Plex, go to Settings → Webhooks →
      Add Webhook, and paste the URL shown in CreditEngine — find it under a server's settings
-     (`/servers/{id}/webhooks/plex?secret=...`). Once added, watching something automatically enables
+     (`/api/servers/{id}/webhooks/plex?secret=...`). Once added, watching something automatically enables
      that show and scans the next few unwatched-ahead episodes (5 by default) — not the whole series.
 
 ## Sonarr/Radarr (optional)

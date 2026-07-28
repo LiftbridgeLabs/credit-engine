@@ -46,7 +46,7 @@ def link_arr_instance(
         raise HTTPException(status_code=400, detail=f"Couldn't reach {body.type}: {exc}")
 
     callback_base = body.callback_base_url.rstrip("/")
-    webhook_url = f"{callback_base}/servers/{server_id}/webhooks/import?secret={server.webhook_secret}"
+    webhook_url = f"{callback_base}/api/servers/{server_id}/webhooks/import?secret={server.webhook_secret}"
 
     try:
         notification_id = create_webhook_connection(body.base_url, body.api_key, webhook_url)

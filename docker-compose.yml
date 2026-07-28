@@ -1,6 +1,11 @@
 services:
+  # container_name is purely cosmetic (what shows in `docker ps`/logs) — the service key above it
+  # (postgres/redis/app) is what the other containers actually use to find each other over the
+  # network, and must stay as-is. Renaming the service key itself (not just container_name) would
+  # break DATABASE_URL/REDIS_URL, which point at "postgres"/"redis" by that exact service name.
   postgres:
     image: postgres:16-alpine
+    container_name: creditengine-postgres
     restart: unless-stopped
     environment:
       POSTGRES_USER: generatarr
@@ -16,6 +21,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    container_name: creditengine-redis
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -23,48 +29,23 @@ services:
       timeout: 5s
       retries: 10
 
-  web:
-    build: ./backend
+  # web + worker + beat + the built frontend, all one image (see /Dockerfile at repo root) —
+  # one container to run, one port to expose. Logs from all three internal processes interleave
+  # on this container's own stdout (docker logs), unprefixed, since restarting/scaling them
+  # independently isn't something a single-user self-hosted deploy needs.
+  app:
+    build: .
+    image: liftbridgelabs/creditengine:latest
+    container_name: creditengine
     restart: unless-stopped
     env_file: .env
     ports:
-      - "8000:8000"
+      - "5173:5173"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
-
-  worker:
-    build: ./backend
-    restart: unless-stopped
-    env_file: .env
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    command: celery -A app.celery_app worker --loglevel=info
-
-  beat:
-    build: ./backend
-    restart: unless-stopped
-    env_file: .env
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    command: celery -A app.celery_app beat --loglevel=info
-
-  frontend:
-    build: ./frontend
-    restart: unless-stopped
-    ports:
-      - "5173:80"
-    depends_on:
-      - web
 
 volumes:
   postgres_data:
