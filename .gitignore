@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+*.egg-info/
+node_modules/
+frontend/dist/
+.claude/settings.local.json
