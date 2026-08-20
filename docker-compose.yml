@@ -1,3 +1,8 @@
+# Pins the project name explicitly (otherwise Compose derives it from whatever folder this file
+# lives in) — without this, renaming or moving the folder changes what name Compose looks for the
+# network under, though NOT the volume, since that's pinned separately below regardless.
+name: creditengine
+
 services:
   # container_name is purely cosmetic (what shows in `docker ps`/logs) — the service key above it
   # (postgres/redis/app) is what the other containers actually use to find each other over the
@@ -48,4 +53,13 @@ services:
         condition: service_healthy
 
 volumes:
+  # Pinned to the actual volume already holding your real data (created back when this project was
+  # still named/pathed as "generatarr") — without this explicit name, Compose derives the volume
+  # name from the project name above, and a fresh "creditengine_postgres_data" volume would be
+  # silently created empty instead of reusing this one. external: true tells Compose to just use
+  # whatever already exists under this name rather than trying to "own"/create it (which is what
+  # produced the "created for project generatarr, expected creditengine" warning) — as a bonus,
+  # Compose will never delete an external volume, so `docker compose down -v` can't touch this one.
   postgres_data:
+    name: generatarr_postgres_data
+    external: true
