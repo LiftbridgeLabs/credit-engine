@@ -36,9 +36,19 @@ export default function AuthPage() {
   async function handlePlexLogin() {
     setError(null);
     setPlexPending(true);
+    const plexPopup = window.open(
+      "about:blank",
+      "credit-engine-plex-auth",
+      "popup=yes,width=480,height=680,menubar=no,toolbar=no,location=yes,status=no,resizable=yes,scrollbars=yes",
+    );
     try {
       const { pin_id, auth_url } = await api.post<{ pin_id: number; auth_url: string }>("/auth/plex/pin");
-      window.open(auth_url, "_blank", "noopener,noreferrer");
+      if (plexPopup) {
+        plexPopup.location.href = auth_url;
+        plexPopup.focus();
+      } else {
+        window.open(auth_url, "_blank");
+      }
 
       // The backend returns 202 for "still pending" — a 2xx status, so the generic api.get()
       // helper would treat it as success with the wrong body shape. Poll with raw fetch instead.
@@ -59,7 +69,10 @@ export default function AuthPage() {
         }
       }
       setError("Timed out waiting for Plex approval.");
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Something went wrong");
     } finally {
+      if (plexPopup && !plexPopup.closed) plexPopup.close();
       setPlexPending(false);
     }
   }
@@ -117,7 +130,7 @@ export default function AuthPage() {
           {plexPending ? <Spinner /> : "Login with Plex"}
         </Button>
         {plexPending && (
-          <p className="text-xs text-slate-500 text-center">Approve the request in the tab that just opened…</p>
+          <p className="text-xs text-slate-500 text-center">Approve the request in the Plex popup…</p>
         )}
       </Card>
     </div>
