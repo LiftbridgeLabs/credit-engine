@@ -13,13 +13,13 @@ services:
     container_name: creditengine-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: generatarr
-      POSTGRES_PASSWORD: generatarr
-      POSTGRES_DB: generatarr
+      POSTGRES_USER: creditengine
+      POSTGRES_PASSWORD: creditengine
+      POSTGRES_DB: creditengine
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U generatarr"]
+      test: ["CMD-SHELL", "pg_isready -h localhost"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -53,13 +53,8 @@ services:
         condition: service_healthy
 
 volumes:
-  # Pinned to the actual volume already holding your real data (created back when this project was
-  # still named/pathed as "generatarr") — without this explicit name, Compose derives the volume
-  # name from the project name above, and a fresh "creditengine_postgres_data" volume would be
-  # silently created empty instead of reusing this one. external: true tells Compose to just use
-  # whatever already exists under this name rather than trying to "own"/create it (which is what
-  # produced the "created for project generatarr, expected creditengine" warning) — as a bonus,
-  # Compose will never delete an external volume, so `docker compose down -v` can't touch this one.
+  # Pinned to the existing external volume so renaming the project cannot create an empty database.
+  # Keep this name unchanged until the database is deliberately migrated to a new volume.
   postgres_data:
     name: generatarr_postgres_data
     external: true
