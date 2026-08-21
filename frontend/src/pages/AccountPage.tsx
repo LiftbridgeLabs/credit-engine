@@ -1,13 +1,15 @@
 import { useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
-import { ArrowLeft, KeyRound, Mail } from "lucide-react";
+import { ArrowLeft, KeyRound, LogOut, Mail, RefreshCw } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import { api, ApiError } from "../lib/api";
 import { useAuth } from "../lib/auth";
 import { Button, Card, ErrorBanner, Input } from "../components/ui";
 import { useToast } from "../components/toast";
 
 export default function AccountPage() {
-  const { me, refresh } = useAuth();
+  const { me, refresh, logout } = useAuth();
+  const navigate = useNavigate();
   const toast = useToast();
 
   const [email, setEmail] = useState(me?.email ?? "");
@@ -56,6 +58,11 @@ export default function AccountPage() {
     }
   }
 
+  function reauthorizePlex() {
+    logout();
+    navigate("/auth");
+  }
+
   return (
     <div className="max-w-lg space-y-5">
       <div>
@@ -66,6 +73,20 @@ export default function AccountPage() {
         <h1 className="text-xl font-semibold text-slate-900 dark:text-white">Account</h1>
         {me.plex_username && <p className="text-sm text-slate-500">Signed in with Plex as {me.plex_username}</p>}
       </div>
+
+      <Card className="space-y-3">
+        <div className="flex items-center gap-2 font-medium text-slate-900 dark:text-white">
+          <RefreshCw className="h-4 w-4 text-slate-400" />
+          Plex authorization
+        </div>
+        <p className="text-sm text-slate-500">
+          Re-authorize this account with Plex if your Plex session has expired or you need to refresh server access.
+          Your linked servers will remain here.
+        </p>
+        <Button icon={<RefreshCw className="h-4 w-4" />} onClick={reauthorizePlex}>
+          Re-authorize with Plex
+        </Button>
+      </Card>
 
       <Card className="space-y-3">
         <div className="flex items-center gap-2 font-medium text-slate-900 dark:text-white">
@@ -119,6 +140,10 @@ export default function AccountPage() {
           </Button>
         </form>
       </Card>
+
+      <Button variant="secondary" icon={<LogOut className="h-4 w-4" />} onClick={reauthorizePlex}>
+        Sign out
+      </Button>
     </div>
   );
 }

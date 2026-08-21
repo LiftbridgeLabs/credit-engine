@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { Plus, RefreshCw, Server, Webhook, ChevronDown, ChevronRight } from "lucide-react";
+import { Plus, RefreshCw, Server, Webhook, ChevronDown, ChevronRight, Trash2 } from "lucide-react";
 import { api, ApiError, type PlexDiscoveredServer, type PlexServerConnection, type ServerConnection } from "../lib/api";
 import { Badge, Button, Card, ErrorBanner, Input, Spinner } from "../components/ui";
 import { EmptyState } from "../components/EmptyState";
@@ -12,6 +12,7 @@ export default function ServersPage() {
   const [error, setError] = useState<string | null>(null);
   const [linking, setLinking] = useState(false);
   const [syncing, setSyncing] = useState<Set<number>>(new Set());
+  const [deleting, setDeleting] = useState<Set<number>>(new Set());
   const toast = useToast();
 
   async function load() {
@@ -49,6 +50,26 @@ export default function ServersPage() {
     }
   }
 
+  async function unlinkServer(e: React.MouseEvent, server: ServerConnection) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!window.confirm(`Remove ${server.name} from CreditEngine?`)) return;
+    setDeleting((prev) => new Set(prev).add(server.id));
+    try {
+      await api.delete(`/servers/${server.id}`);
+      setServers((prev) => prev?.filter((item) => item.id !== server.id) ?? prev);
+      toast(`Removed ${server.name}`);
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : "Failed to remove server");
+    } finally {
+      setDeleting((prev) => {
+        const next = new Set(prev);
+        next.delete(server.id);
+        return next;
+      });
+    }
+  }
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -68,6 +89,11 @@ export default function ServersPage() {
       {linking && (
         <Modal title="Link a Plex server" onClose={() => setLinking(false)}>
           <LinkServerForm
+            linkedClientIdentifiers={new Set(
+              (servers ?? [])
+                .map((server) => server.client_identifier)
+                .filter((identifier): identifier is string => identifier !== null),
+            )}
             onLinked={() => {
               setLinking(false);
               load();
@@ -97,7 +123,8 @@ export default function ServersPage() {
 
       <div className="grid gap-3 sm:grid-cols-2">
         {servers?.map((s) => (
-          <Link key={s.id} to={`/servers/${s.id}`}>
+          <div key={s.id} className="relative">
+            <Link to={`/servers/${s.id}`}>
             <Card hover className="h-full">
               <div className="flex items-start gap-3">
                 <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-brand-50 dark:bg-brand-950 text-brand-600 dark:text-brand-400">
@@ -125,11 +152,22 @@ export default function ServersPage() {
                     >
                       Sync library
                     </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      icon={<Trash2 className="h-3 w-3" />}
+                      onClick={(e) => unlinkServer(e, s)}
+                      disabled={deleting.has(s.id)}
+                      title="Remove this server from CreditEngine"
+                    >
+                      Remove
+                    </Button>
                   </div>
                 </div>
               </div>
             </Card>
-          </Link>
+            </Link>
+          </div>
         ))}
       </div>
     </div>
@@ -174,7 +212,13 @@ function connectionKind(c: PlexServerConnection): { label: string; tone: "good" 
   return { label: "Remote", tone: "neutral" };
 }
 
-function LinkServerForm({ onLinked }: { onLinked: () => void }) {
+function LinkServerForm({
+  linkedClientIdentifiers,
+  onLinked,
+}: {
+  linkedClientIdentifiers: Set<string>;
+  onLinked: () => void;
+}) {
   const [mode, setMode] = useState<"plex" | "manual">("plex");
   const [discovered, setDiscovered] = useState<PlexDiscoveredServer[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -264,8 +308,10 @@ function LinkServerForm({ onLinked }: { onLinked: () => void }) {
               <Spinner />
             </div>
           )}
-          {discovered?.length === 0 && <p className="text-sm text-slate-500">No servers found on your account.</p>}
-          {discovered?.map((server) => {
+          {discovered?.filter((server) => !linkedClientIdentifiers.has(server.client_identifier)).length === 0 && (
+            <p className="text-sm text-slate-500">No unlinked servers found on your Plex account.</p>
+          )}
+          {discovered?.filter((server) => !linkedClientIdentifiers.has(server.client_identifier)).map((server) => {
             const ranked = [...server.connections].sort((a, b) => connectionScore(a) - connectionScore(b));
             const [recommended, ...rest] = ranked;
             const others = rest.filter((c) => !isDockerBridgeUri(c.uri) || ranked.every((r) => isDockerBridgeUri(r.uri)));
