@@ -35,8 +35,8 @@ export default function ServersPage() {
       const res = await api.post<{ status: string }>(`/servers/${serverId}/sync-content`);
       toast(
         res.status === "already_running"
-          ? "A library sync is already running for this server — leaving it to finish"
-          : "Library sync started — running in the background, can take a while on a large library",
+          ? "A content sync is already running for this server — leaving it to finish"
+          : "Content sync started — running in the background, can take a while on a large library",
       );
     } catch (err) {
       toast(err instanceof ApiError ? err.message : "Failed to start sync");
@@ -152,9 +152,9 @@ export default function ServersPage() {
                       onClick={(e) => syncContent(e, s.id)}
                       disabled={syncing.has(s.id)}
                       className="ml-auto"
-                      title="Caches library titles/art references so Browse loads instantly instead of hitting Plex live every time"
+                      title="Rebuilds the cached contents of every included library — titles, art references and credits status — so new shows and movies appear in Browse. Runs automatically on an interval; this is the don't-wait-for-it button."
                     >
-                      Sync library
+                      Sync content
                     </Button>
                     <Button
                       size="sm"

@@ -58,8 +58,15 @@ export default function LibrariesTab({ serverId }: { serverId: number }) {
             to that library's dashboard — credits status, filtering, and scanning.
           </span>
         </div>
-        <Button variant="secondary" icon={<RefreshCw className={`h-3.5 w-3.5 ${syncing ? "animate-spin" : ""}`} />} onClick={sync} disabled={syncing} className="shrink-0">
-          Sync
+        <Button
+          variant="secondary"
+          icon={<RefreshCw className={`h-3.5 w-3.5 ${syncing ? "animate-spin" : ""}`} />}
+          onClick={sync}
+          disabled={syncing}
+          className="shrink-0"
+          title="Re-reads which library sections exist on this Plex server. Doesn't touch cached titles, art or credits status — that's Sync content, on the Servers page."
+        >
+          Refresh list
         </Button>
       </div>
 
@@ -74,11 +81,11 @@ export default function LibrariesTab({ serverId }: { serverId: number }) {
       {libraries?.length === 0 && (
         <EmptyState
           icon={<FolderOpen className="h-10 w-10" />}
-          title="No libraries synced yet"
-          description="Sync to pull in this server's library sections."
+          title="No libraries found yet"
+          description="Refresh to pull in this server's library sections."
           action={
             <Button icon={<RefreshCw className="h-3.5 w-3.5" />} onClick={sync} disabled={syncing}>
-              Sync libraries
+              Refresh list
             </Button>
           }
         />
