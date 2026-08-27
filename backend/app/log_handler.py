@@ -1,5 +1,7 @@
 import logging
 
+from celery.signals import after_setup_logger, after_setup_task_logger
+
 from app.db import SessionLocal
 from app.models import LogEntry
 
@@ -7,7 +9,21 @@ from app.models import LogEntry
 # Plex library scan or a page of pagination in the UI would flood the log table with entries no one
 # asked to see. The root logger stays at DEBUG so app.* loggers pass everything through for the
 # "Debug" filter tier; these are the exceptions, dialed back to WARNING individually.
-_QUIET_LOGGERS = ["httpx", "httpcore", "urllib3", "uvicorn.access", "asyncio", "celery.utils.functional"]
+# "celery" covers the worker's own per-task chatter, which is genuinely per-task: a single library
+# sync queues thousands of scans, and "Task received"/"succeeded" for each would bury the app's own
+# progress lines in the very view meant to show them (5 days of container stdout held ~19k
+# "received" lines). Its ERROR records — the "Task raised unexpected" tracebacks — still come
+# through, which is the part worth keeping.
+_QUIET_LOGGERS = [
+    "httpx",
+    "httpcore",
+    "urllib3",
+    "uvicorn.access",
+    "asyncio",
+    "celery",
+    "kombu",
+    "amqp",
+]
 
 
 class DatabaseLogHandler(logging.Handler):
@@ -49,3 +65,20 @@ def install_log_handler() -> None:
 
     for name in _QUIET_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
+
+
+@after_setup_logger.connect
+@after_setup_task_logger.connect
+def _reinstall_after_celery_setup(**_kwargs) -> None:
+    """Put the database handler back after Celery has configured logging in a worker or beat process.
+
+    Celery replaces the root logger's handlers wholesale at startup (worker_hijack_root_logger,
+    on by default), so the handler installed when celery_app was imported was gone before a single
+    task ran — root went from [DatabaseLogHandler] to [StreamHandler]. Every task log line (scans,
+    rule applies, library sync progress) reached the container's stdout and nowhere else, which is
+    why the Logs page only ever showed records emitted by the web process.
+
+    Re-installing here rather than setting worker_hijack_root_logger=False is deliberate: Celery
+    still configures its own stdout logging exactly as it always has, and the database handler is
+    simply added back alongside it once that's done."""
+    install_log_handler()
