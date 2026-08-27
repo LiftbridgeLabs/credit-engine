@@ -2,32 +2,47 @@ import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { ArrowLeft, ScrollText, Pause, Play, Trash2, Info } from "lucide-react";
 import { api, ApiError, type LogEntry, type LogLevel } from "../lib/api";
-import { Badge, Button, ErrorBanner } from "../components/ui";
+import { Button, ErrorBanner } from "../components/ui";
 
 const LEVELS: LogLevel[] = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"];
 
-const LEVEL_TONE: Record<LogLevel, "neutral" | "brand" | "warn" | "bad"> = {
-  DEBUG: "neutral",
-  INFO: "brand",
-  WARNING: "warn",
-  ERROR: "bad",
-  CRITICAL: "bad",
+// Short, fixed-width labels so the level column lines up and the eye can scan straight down it.
+// A full-width Badge pill per row was heavier than the message it was labelling.
+const LEVEL_LABEL: Record<LogLevel, string> = {
+  DEBUG: "DEBUG",
+  INFO: "INFO",
+  WARNING: "WARN",
+  ERROR: "ERROR",
+  CRITICAL: "CRIT",
 };
 
-// Tuned for the console's own dark background, which it keeps in both themes — see the panel
-// below for why it isn't a Card.
-const LEVEL_TEXT_COLOR: Record<LogLevel, string> = {
-  DEBUG: "text-slate-400",
-  INFO: "text-slate-100",
-  WARNING: "text-amber-300",
-  ERROR: "text-red-300",
-  CRITICAL: "text-red-300",
+// Readable on the page's own background in both themes. The previous attempt forced a dark
+// console into a light app, which fixed the contrast bug but left the panel fighting everything
+// around it — and still rendered small, unaligned grey-on-dark text.
+const LEVEL_COLOR: Record<LogLevel, string> = {
+  DEBUG: "text-slate-400 dark:text-slate-500",
+  INFO: "text-sky-600 dark:text-sky-400",
+  WARNING: "text-amber-600 dark:text-amber-400",
+  ERROR: "text-red-600 dark:text-red-400",
+  CRITICAL: "text-red-600 dark:text-red-400",
 };
 
-// Anything longer than this, or containing newlines, is collapsed to its first line behind a
-// toggle. A single Celery traceback is ~60 lines and would otherwise push everything else out of
-// view — which is exactly what makes the interesting entry impossible to find.
+const MESSAGE_COLOR: Record<LogLevel, string> = {
+  DEBUG: "text-slate-500 dark:text-slate-400",
+  INFO: "text-slate-800 dark:text-slate-100",
+  WARNING: "text-amber-700 dark:text-amber-300",
+  ERROR: "text-red-700 dark:text-red-300",
+  CRITICAL: "text-red-700 dark:text-red-300",
+};
+
+// Anything longer than this, or containing newlines, collapses to its first line behind a toggle.
+// A single Celery traceback is ~60 lines and would otherwise push every other entry out of view,
+// which is exactly what makes the interesting one impossible to find.
 const COLLAPSE_OVER_CHARS = 200;
+
+// Keep the rendered list bounded — a long overnight session at Debug level could otherwise grow
+// the DOM without limit even though the underlying table is already capped by retention settings.
+const MAX_RENDERED = 1000;
 
 function LogRow({ entry }: { entry: LogEntry }) {
   const [expanded, setExpanded] = useState(false);
@@ -35,41 +50,41 @@ function LogRow({ entry }: { entry: LogEntry }) {
   const firstLine = entry.message.split("\n", 1)[0];
 
   return (
-    <div className="py-0.5 border-b border-slate-900/70 last:border-0">
-      <div className="flex gap-2 items-baseline">
-        <span className="text-slate-500 shrink-0 tabular-nums">
+    <div className="border-b border-slate-100 dark:border-slate-800/70 last:border-0 hover:bg-slate-50 dark:hover:bg-slate-800/40">
+      <div className="flex gap-3 px-3 py-1.5 items-baseline">
+        <time className="shrink-0 w-[5.5rem] tabular-nums text-slate-400 dark:text-slate-500">
           {new Date(entry.created_at).toLocaleTimeString()}
+        </time>
+        <span className={`shrink-0 w-12 font-semibold ${LEVEL_COLOR[entry.level]}`}>
+          {LEVEL_LABEL[entry.level]}
         </span>
-        <span className="shrink-0">
-          <Badge tone={LEVEL_TONE[entry.level]}>{entry.level}</Badge>
+        <span className="shrink-0 w-44 truncate text-slate-400 dark:text-slate-500 hidden md:block">
+          {entry.logger_name}
         </span>
-        <span className="text-slate-500 shrink-0">{entry.logger_name}</span>
-        <span className={`${LEVEL_TEXT_COLOR[entry.level]} ${long ? "truncate" : "break-words"} min-w-0`}>
+        <span className={`min-w-0 flex-1 ${MESSAGE_COLOR[entry.level]} ${long ? "truncate" : "break-words"}`}>
           {long ? firstLine : entry.message}
         </span>
         {long && (
           <button
             onClick={() => setExpanded((v) => !v)}
-            className="shrink-0 ml-auto text-slate-400 hover:text-slate-200 underline decoration-dotted"
+            className="shrink-0 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 underline decoration-dotted"
           >
             {expanded ? "hide" : "details"}
           </button>
         )}
       </div>
       {long && expanded && (
-        // whitespace-pre-wrap keeps a traceback's line structure; break-words wraps only at word
+        // whitespace-pre-wrap keeps a traceback's line structure; break-words wraps at word
         // boundaries, where break-all used to split identifiers mid-character into noise.
-        <pre className={`${LEVEL_TEXT_COLOR[entry.level]} whitespace-pre-wrap break-words mt-1 mb-2 pl-2 border-l-2 border-slate-700`}>
+        <pre
+          className={`${MESSAGE_COLOR[entry.level]} whitespace-pre-wrap break-words mx-3 mb-2 pl-3 border-l-2 border-slate-200 dark:border-slate-700`}
+        >
           {entry.message}
         </pre>
       )}
     </div>
   );
 }
-
-// Keep the rendered list bounded — a long overnight session at Debug level could otherwise grow
-// the DOM without limit even though the underlying table is already capped by retention settings.
-const MAX_RENDERED = 1000;
 
 export default function LogsPage() {
   const [entries, setEntries] = useState<LogEntry[]>([]);
@@ -145,10 +160,8 @@ export default function LogsPage() {
           <ScrollText className="h-5 w-5" /> Logs
         </h1>
         <p className="text-sm text-slate-500">
-          Everything CreditEngine does across every server — bootstraps, rule applies, scans, and webhook
-          activity. Updates live every couple seconds; pause to freeze the view without losing anything.
-          Almost everything is logged at INFO — Debug adds only a couple of internal messages, so it will
-          look much the same.
+          Everything CreditEngine does across every server. Updates live; pause to freeze the view
+          without losing anything.
         </p>
       </div>
 
@@ -164,6 +177,9 @@ export default function LogsPage() {
             </option>
           ))}
         </select>
+        <span className="text-xs text-slate-400 hidden sm:inline">
+          almost everything is logged at INFO
+        </span>
         <Button
           variant="secondary"
           size="sm"
@@ -193,14 +209,14 @@ export default function LogsPage() {
         </div>
       )}
 
-      {/* Deliberately not a Card: Card hardcodes `bg-white dark:bg-slate-900`, and a `bg-slate-950`
+      {/* Deliberately not a Card: Card hardcodes `bg-white dark:bg-slate-900`, and a background
           passed through className competes with it in the same Tailwind layer rather than
-          overriding it — so this panel used to render white in light mode while its text colours
-          were chosen for a dark background, which is what made it unreadable. A console stays a
-          console in both themes. */}
-      <div className="rounded-xl border border-slate-800 bg-slate-950 shadow-sm overflow-hidden">
-        <div className="max-h-[65vh] overflow-y-auto px-4 py-3 font-mono text-xs leading-relaxed">
-          {entries.length === 0 && <p className="text-slate-500">No log entries at this level yet.</p>}
+          overriding it — which is what left this panel unreadable in the first place. */}
+      <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-sm overflow-hidden">
+        <div className="max-h-[65vh] overflow-y-auto font-mono text-[13px] leading-6">
+          {entries.length === 0 && (
+            <p className="px-3 py-3 text-slate-500 dark:text-slate-400">No log entries at this level yet.</p>
+          )}
           {entries.map((e) => (
             <LogRow key={e.id} entry={e} />
           ))}
