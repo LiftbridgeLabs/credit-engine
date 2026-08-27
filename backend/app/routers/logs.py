@@ -59,6 +59,7 @@ def _get_or_create_settings(db: Session) -> AppSettings:
 class LogSettingsRequest(BaseModel):
     log_max_entries: int
     log_retention_days: int
+    content_sync_interval_hours: int
 
 
 @settings_router.get("/version")
@@ -83,10 +84,15 @@ def update_log_settings(
         raise HTTPException(status_code=400, detail="Max entries must be at least 100")
     if body.log_retention_days < 1:
         raise HTTPException(status_code=400, detail="Retention must be at least 1 day")
+    # 0 is meaningful (never rebuild automatically); anything between 0 and 1 hour would mean a
+    # full library rebuild kicking off almost continuously.
+    if body.content_sync_interval_hours != 0 and body.content_sync_interval_hours < 1:
+        raise HTTPException(status_code=400, detail="Sync interval must be 0 (off) or at least 1 hour")
 
     cfg = _get_or_create_settings(db)
     cfg.log_max_entries = body.log_max_entries
     cfg.log_retention_days = body.log_retention_days
+    cfg.content_sync_interval_hours = body.content_sync_interval_hours
     db.commit()
     db.refresh(cfg)
     return cfg

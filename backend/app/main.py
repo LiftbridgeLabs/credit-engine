@@ -7,6 +7,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.db import Base, engine
 from app.log_handler import install_log_handler
+from app.migrations import run_migrations
 from app.routers import arr_instances, auth, batches, browse, libraries, logs, rules, scans, servers, webhooks
 
 app = FastAPI(title="CreditEngine")
@@ -23,6 +24,9 @@ app.add_middleware(
 )
 
 Base.metadata.create_all(bind=engine)
+# create_all only creates missing tables — this adds columns missing from tables that already
+# exist, which is what lets a new setting reach an install that's been running for months.
+run_migrations(engine)
 
 # Every API route lives under /api — the frontend is served from the same origin (below) and uses
 # client-side routes like /servers/3, /logs, /settings that would otherwise collide exactly with

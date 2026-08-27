@@ -199,9 +199,10 @@ class CachedItem(Base):
 
 
 class AppSettings(Base):
-    """Single-row table (id is always 1) for app-wide settings that don't belong to any one server —
-    currently just log retention. A real settings table rather than env vars because these are meant
-    to be changed at runtime from the Settings page, not at container-start time."""
+    """Single-row table (id is always 1) for app-wide settings that don't belong to any one server.
+    A real settings table rather than env vars because these are meant to be changed at runtime from
+    the Settings page, not at container-start time — see app/migrations.py, which is what makes
+    adding a column here reach an already-deployed database."""
 
     __tablename__ = "app_settings"
 
@@ -212,3 +213,8 @@ class AppSettings(Base):
     # anyway since rows are similar sizes.
     log_max_entries: Mapped[int] = mapped_column(Integer, default=50_000)
     log_retention_days: Mapped[int] = mapped_column(Integer, default=30)
+
+    # How old an included library's cached contents may get before check_content_sync rebuilds
+    # them. Not a schedule — the beat entry decides how often staleness is *checked*, this decides
+    # what counts as stale. 0 disables the automatic rebuild, leaving only the Sync content button.
+    content_sync_interval_hours: Mapped[int] = mapped_column(Integer, default=24)

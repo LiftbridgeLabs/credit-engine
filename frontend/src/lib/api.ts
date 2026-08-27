@@ -221,4 +221,5 @@ export interface AppSettings {
   id: number;
   log_max_entries: number;
   log_retention_days: number;
+  content_sync_interval_hours: number;
 }

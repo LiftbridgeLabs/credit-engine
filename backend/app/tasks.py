@@ -670,7 +670,7 @@ def sync_library_contents(server_id: int) -> None:
 
 @celery_app.task(name="app.tasks.check_content_sync")
 def check_content_sync() -> None:
-    """Rebuilds each server's browse cache once it passes settings.content_sync_interval_hours.
+    """Rebuilds each server's browse cache once it passes AppSettings.content_sync_interval_hours.
 
     Without this the cache only ever changed when someone pressed "Sync" on the Servers page, so
     anything added to Plex afterwards stayed invisible in CreditEngine indefinitely — browse serves
@@ -680,12 +680,16 @@ def check_content_sync() -> None:
     Staleness is read off Library.content_synced_at, which sync_library_contents only advances for
     libraries it actually rebuilt, so a failed or partial run stays due instead of being recorded as
     done."""
-    interval_hours = settings.content_sync_interval_hours
-    if interval_hours <= 0:
-        return
-
     db = SessionLocal()
     try:
+        cfg = db.get(AppSettings, 1)
+        # No settings row yet means nothing has ever been configured — the web process creates it on
+        # first read. Falling back to the model default here instead of skipping keeps a fresh
+        # install syncing without someone having to open the Settings page first.
+        interval_hours = cfg.content_sync_interval_hours if cfg is not None else 24
+        if interval_hours <= 0:
+            return
+
         cutoff = datetime.now(timezone.utc) - timedelta(hours=interval_hours)
         for server in db.query(ServerConnection):
             libraries = db.query(Library).filter_by(server_id=server.id, included=True).all()

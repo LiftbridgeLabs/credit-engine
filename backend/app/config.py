@@ -11,11 +11,11 @@ class Settings(BaseSettings):
     plex_client_identifier: str
     plex_product: str = "CreditEngine"
 
-    # How often the browse cache (CachedItem) is rebuilt from Plex, in hours — see
-    # tasks.check_content_sync. Env-driven rather than a row in AppSettings because there's no
-    # migration story here (Base.metadata.create_all only ever creates missing tables, never adds
-    # columns to existing ones), so a new settings column wouldn't reach an already-deployed
-    # database. 0 disables the periodic rebuild, leaving only the manual Sync button.
+    # Seed for AppSettings.content_sync_interval_hours, which is where the interval actually lives
+    # now that app/migrations.py can add a column to a deployed database. Read once, by the
+    # migration that first creates the column — so an install that had deliberately set this env
+    # var keeps its value on upgrade instead of silently reverting to the default. Nothing reads it
+    # afterwards; the Settings page is the source of truth from then on.
     content_sync_interval_hours: int = 24
 
     # Build stamp, set by the Dockerfile's APP_VERSION arg. "dev" means an unstamped build (running

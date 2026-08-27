@@ -9,6 +9,7 @@ export default function SettingsPage() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [maxEntries, setMaxEntries] = useState(50_000);
   const [retentionDays, setRetentionDays] = useState(30);
+  const [syncInterval, setSyncInterval] = useState(24);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const toast = useToast();
@@ -20,6 +21,7 @@ export default function SettingsPage() {
         setSettings(s);
         setMaxEntries(s.log_max_entries);
         setRetentionDays(s.log_retention_days);
+        setSyncInterval(s.content_sync_interval_hours);
       })
       .catch((err) => setError(err instanceof ApiError ? err.message : "Failed to load settings"));
   }, []);
@@ -31,6 +33,7 @@ export default function SettingsPage() {
       const updated = await api.patch<AppSettings>("/settings/logs", {
         log_max_entries: maxEntries,
         log_retention_days: retentionDays,
+        content_sync_interval_hours: syncInterval,
       });
       setSettings(updated);
       toast("Settings saved");
@@ -41,7 +44,11 @@ export default function SettingsPage() {
     }
   }
 
-  const dirty = settings !== null && (maxEntries !== settings.log_max_entries || retentionDays !== settings.log_retention_days);
+  const dirty =
+    settings !== null &&
+    (maxEntries !== settings.log_max_entries ||
+      retentionDays !== settings.log_retention_days ||
+      syncInterval !== settings.content_sync_interval_hours);
 
   return (
     <div className="space-y-4">
@@ -65,6 +72,45 @@ export default function SettingsPage() {
         <div className="flex justify-center py-12">
           <Spinner />
         </div>
+      )}
+
+      {settings && (
+        <Card className="space-y-4">
+          <div>
+            <h2 className="font-medium text-slate-900 dark:text-white">Library sync</h2>
+            <p className="text-sm text-slate-500">
+              CreditEngine caches what's in each included library so browsing is instant. New shows and
+              movies only appear once that cache is rebuilt.
+            </p>
+          </div>
+
+          <div className="flex items-start gap-2 text-sm text-slate-600 dark:text-slate-300 bg-slate-50 dark:bg-slate-800/50 rounded-lg px-3.5 py-3">
+            <Info className="h-4 w-4 mt-0.5 shrink-0 text-slate-400" />
+            <p>
+              This is a staleness limit, not a timetable. Every 15 minutes CreditEngine checks each
+              library's age and rebuilds any that are older than this — so a rebuild starts within 15
+              minutes of becoming due, not at a fixed hour. A rebuild is one Plex request per episode,
+              so keep it generous on a large library. "Sync content" on a server runs one immediately.
+            </p>
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div>
+              <label className="block text-sm font-medium mb-1">Rebuild when older than (hours)</label>
+              <Input
+                type="number"
+                min={0}
+                value={syncInterval}
+                onChange={(e) => setSyncInterval(Number(e.target.value))}
+              />
+              <p className="text-xs text-slate-500 mt-1">
+                {syncInterval === 0
+                  ? "Automatic rebuilds are off — only the Sync content button will refresh it."
+                  : "0 turns automatic rebuilds off. Minimum 1 hour."}
+              </p>
+            </div>
+          </div>
+        </Card>
       )}
 
       {settings && (
@@ -105,11 +151,13 @@ export default function SettingsPage() {
               <p className="text-xs text-slate-500 mt-1">At least 1 day.</p>
             </div>
           </div>
-
-          <Button onClick={save} disabled={saving || !dirty} icon={saving ? <Spinner /> : undefined}>
-            Save
-          </Button>
         </Card>
+      )}
+
+      {settings && (
+        <Button onClick={save} disabled={saving || !dirty} icon={saving ? <Spinner /> : undefined}>
+          Save
+        </Button>
       )}
     </div>
   );

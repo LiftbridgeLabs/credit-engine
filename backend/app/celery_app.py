@@ -1,9 +1,22 @@
 from celery import Celery
+from celery.signals import beat_init, worker_init
 
 from app.config import settings
+from app.db import engine
 from app.log_handler import install_log_handler
+from app.migrations import run_migrations
 
 install_log_handler()
+
+
+@worker_init.connect
+@beat_init.connect
+def _run_migrations_on_start(**_kwargs) -> None:
+    """The worker and beat never import main.py, so they'd otherwise start against a database that
+    hasn't had new columns added yet and fail on the first query naming one. Run from the startup
+    signals rather than at import time so merely importing this module (a smoke test, a shell) still
+    doesn't need a reachable database."""
+    run_migrations(engine)
 
 celery_app = Celery(
     "credit_engine",
