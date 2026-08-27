@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.db import get_db
 from app.models import AppSettings, LogEntry, User
 from app.security import get_current_user
@@ -58,6 +59,13 @@ def _get_or_create_settings(db: Session) -> AppSettings:
 class LogSettingsRequest(BaseModel):
     log_max_entries: int
     log_retention_days: int
+
+
+@settings_router.get("/version")
+def get_version():
+    """Deliberately unauthenticated: it's a build stamp, nothing more, and it's most useful exactly
+    when something is wrong enough that logging in is the thing you're trying to rule out."""
+    return {"version": settings.app_version}
 
 
 @settings_router.get("/logs")

@@ -68,6 +68,10 @@ export const api = {
 
 // --- Types mirroring the backend's Pydantic/SQLAlchemy shapes ---
 
+export interface VersionInfo {
+  version: string;
+}
+
 export interface AuthStatus {
   has_users: boolean;
 }

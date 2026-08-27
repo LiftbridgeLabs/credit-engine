@@ -14,6 +14,13 @@ RUN npm run build
 FROM python:3.12-slim
 WORKDIR /app
 
+# Stamped at build time (docker build --build-arg APP_VERSION=$(git rev-parse --short HEAD)) so a
+# running container can say exactly what it is — surfaced at /api/version and in the UI footer.
+# Without it there's no way to tell a deployed image apart from the one before it, which makes
+# "did my update actually land?" unanswerable.
+ARG APP_VERSION=dev
+ENV APP_VERSION=${APP_VERSION}
+
 COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     # database. 0 disables the periodic rebuild, leaving only the manual Sync button.
     content_sync_interval_hours: int = 24
 
+    # Build stamp, set by the Dockerfile's APP_VERSION arg. "dev" means an unstamped build (running
+    # from source, or a plain `docker build` with no --build-arg).
+    app_version: str = "dev"
+
     class Config:
         env_file = ".env"
 

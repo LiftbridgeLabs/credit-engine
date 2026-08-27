@@ -1,11 +1,24 @@
+import { useEffect, useState } from "react";
 import { Link, Outlet, useNavigate } from "react-router-dom";
 import { Clapperboard, LogOut, ScrollText, Settings2, User } from "lucide-react";
+import { api, type VersionInfo } from "../lib/api";
 import { useAuth } from "../lib/auth";
 import { Button } from "./ui";
 
 export default function Layout() {
   const { me, logout } = useAuth();
   const navigate = useNavigate();
+  // Which build is actually running — the answer to "did my update land?". Fetched once per mount
+  // and failure-silent: an unreachable backend already surfaces itself on every other page, and a
+  // missing footer is better than an error banner over whatever the user came here to do.
+  const [version, setVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    api
+      .get<VersionInfo>("/settings/version")
+      .then((v) => setVersion(v.version))
+      .catch(() => {});
+  }, []);
 
   function handleLogout() {
     logout();
@@ -53,6 +66,10 @@ export default function Layout() {
       <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 py-6">
         <Outlet />
       </main>
+      <footer className="border-t border-slate-200 dark:border-slate-800 px-4 sm:px-6 py-3 text-xs text-slate-400 dark:text-slate-600 flex items-center justify-between">
+        <span>CreditEngine</span>
+        {version && <span className="font-mono">{version}</span>}
+      </footer>
     </div>
   );
 }
