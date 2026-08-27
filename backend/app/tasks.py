@@ -1,4 +1,5 @@
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -47,9 +48,16 @@ _CREDITS_CHECK_WORKERS = 8
 # wholesale, so exactly one may be in flight per server. Without this, check_content_sync would
 # queue a fresh one every time it ran while a multi-hour sync was still going — content_synced_at
 # isn't advanced until a library finishes, so the server stays "stale" for the whole run — and they
-# would stack until the worker pool was doing nothing else. The TTL is a backstop for a worker
-# killed mid-sync, which would otherwise hold the lock forever.
-_CONTENT_SYNC_LOCK_TTL_SECONDS = 12 * 60 * 60
+# would stack until the worker pool was doing nothing else.
+#
+# The lock is released in a finally block, which a killed process never reaches — a container
+# restarted mid-sync used to leave the lock behind for its full TTL, and with a TTL measured in
+# hours that meant "a content sync is already running" for the rest of the day with nothing
+# actually running and no way to clear it. So the TTL is short and a heartbeat renews it for as
+# long as the sync is genuinely alive: a real multi-hour sync keeps its lock, while an abandoned
+# one frees itself within the TTL.
+_CONTENT_SYNC_LOCK_TTL_SECONDS = 300
+_CONTENT_SYNC_HEARTBEAT_SECONDS = 60
 
 logger = logging.getLogger(__name__)
 
@@ -68,17 +76,59 @@ def is_content_sync_running(server_id: int) -> bool:
         client.close()
 
 
+def content_sync_started_at(server_id: int) -> datetime | None:
+    """When the in-flight sync started, or None if nothing holds the lock. "Already running" is far
+    easier to trust when it can say since when — a start time from four hours ago on a library that
+    takes twenty minutes says something is wrong, and the bare message never could."""
+    client = redis.Redis.from_url(settings.redis_url)
+    try:
+        raw = client.get(_content_sync_lock_key(server_id))
+    finally:
+        client.close()
+    if raw is None:
+        return None
+    try:
+        return datetime.fromisoformat(raw.decode())
+    except (AttributeError, ValueError):
+        return None  # a lock written by an older build, which stored no timestamp
+
+
 @contextmanager
 def _content_sync_lock(server_id: int):
     """Yields True if this caller holds the server's sync lock, False if someone else already does.
     Deliberately not a wait-then-proceed lock: a queued duplicate has nothing useful to add by the
-    time the one ahead of it finishes, so it's dropped instead."""
+    time the one ahead of it finishes, so it's dropped instead.
+
+    While held, a daemon thread renews the TTL — see the constants above for why the lock can't
+    simply be given a long expiry."""
     client = redis.Redis.from_url(settings.redis_url)
     key = _content_sync_lock_key(server_id)
-    acquired = bool(client.set(key, "1", nx=True, ex=_CONTENT_SYNC_LOCK_TTL_SECONDS))
+    acquired = bool(
+        client.set(key, datetime.now(timezone.utc).isoformat(), nx=True, ex=_CONTENT_SYNC_LOCK_TTL_SECONDS)
+    )
+
+    done = threading.Event()
+
+    def _renew() -> None:
+        # wait() returns True the moment the sync finishes, which ends the loop without waiting out
+        # the remaining interval.
+        while not done.wait(_CONTENT_SYNC_HEARTBEAT_SECONDS):
+            try:
+                client.expire(key, _CONTENT_SYNC_LOCK_TTL_SECONDS)
+            except Exception:  # noqa: BLE001 — a lost heartbeat must not kill the sync it guards
+                return
+
+    heartbeat = None
+    if acquired:
+        heartbeat = threading.Thread(target=_renew, name=f"content-sync-heartbeat-{server_id}", daemon=True)
+        heartbeat.start()
+
     try:
         yield acquired
     finally:
+        done.set()
+        if heartbeat is not None:
+            heartbeat.join(timeout=5)
         if acquired:
             client.delete(key)
         client.close()
@@ -620,6 +670,13 @@ def sync_library_contents(server_id: int) -> None:
                 logger.warning("Library sync requested for %s but no libraries are included", server.name, extra={"server_id": server_id})
                 return
 
+            logger.info(
+                "Library sync starting for %s: %d included librar%s",
+                server.name,
+                len(libraries),
+                "y" if len(libraries) == 1 else "ies",
+                extra={"server_id": server_id},
+            )
             plex = connect(server.base_url, server.token)
 
             total = 0

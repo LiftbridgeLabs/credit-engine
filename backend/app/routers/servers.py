@@ -9,7 +9,7 @@ from app.models import ServerConnection, User
 from app.plex_client import connect, get_diagnostics, set_global_credits_behavior
 from app.routers.libraries import sync_libraries_now
 from app.security import get_current_user
-from app.tasks import bootstrap_credits_control, is_content_sync_running, sync_library_contents
+from app.tasks import bootstrap_credits_control, content_sync_started_at, sync_library_contents
 
 router = APIRouter(prefix="/servers", tags=["servers"])
 
@@ -138,8 +138,10 @@ def sync_content(server_id: int, current_user: User = Depends(get_current_user),
     server = _get_owned_server(server_id, current_user, db)
     # Only one sync runs per server (tasks._content_sync_lock), so a second request is dropped on
     # arrival. Reporting "started" for a request that's really going to be discarded is exactly the
-    # kind of silent no-op that makes a stale cache hard to notice.
-    if is_content_sync_running(server.id):
-        return {"status": "already_running"}
+    # kind of silent no-op that makes a stale cache hard to notice. The start time goes back with
+    # it so "already running" can be sanity-checked rather than taken on faith.
+    started_at = content_sync_started_at(server.id)
+    if started_at is not None:
+        return {"status": "already_running", "started_at": started_at.isoformat()}
     sync_library_contents.delay(server_id)
     return {"status": "sync_started"}

@@ -32,12 +32,19 @@ export default function ServersPage() {
     e.stopPropagation();
     setSyncing((prev) => new Set(prev).add(serverId));
     try {
-      const res = await api.post<{ status: string }>(`/servers/${serverId}/sync-content`);
-      toast(
-        res.status === "already_running"
-          ? "A content sync is already running for this server — leaving it to finish"
-          : "Content sync started — running in the background, can take a while on a large library",
-      );
+      const res = await api.post<{ status: string; started_at?: string }>(`/servers/${serverId}/sync-content`);
+      if (res.status === "already_running") {
+        // Saying since when matters: a start time from hours ago on a library that takes minutes
+        // is the difference between "be patient" and "something is stuck".
+        const since = res.started_at ? new Date(res.started_at).toLocaleTimeString() : null;
+        toast(
+          since
+            ? `A content sync has been running since ${since} — leaving it to finish`
+            : "A content sync is already running for this server — leaving it to finish",
+        );
+      } else {
+        toast("Content sync started — running in the background, can take a while on a large library");
+      }
     } catch (err) {
       toast(err instanceof ApiError ? err.message : "Failed to start sync");
     } finally {
