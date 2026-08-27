@@ -24,10 +24,12 @@ from app.models import (
     ServerConnection,
 )
 from app.plex_client import (
+    CREDITS_BATCH_SIZE,
     analyze_item,
     apply_credits_rule,
     check_credits_enabled,
     check_has_credits,
+    check_has_credits_bulk,
     connect,
     describe_item,
     disable_item_credits,
@@ -44,6 +46,11 @@ from app.plex_client import (
 # maximized: this is extra concurrent load on top of whatever else is already hitting the same
 # Plex server (playback, other scans), and Plex itself has to serve every one of these requests.
 _CREDITS_CHECK_WORKERS = 8
+
+# Batched marker lookups do far more per request, so fewer of them run at once — this is the shape
+# that measured fastest (4 x 100) and it is gentler on Plex than the old eight-at-a-time trickle
+# while being an order of magnitude quicker overall.
+_CREDITS_BATCH_WORKERS = 4
 
 # A content sync is long (one Plex round trip per movie/episode) and rebuilds each library's rows
 # wholesale, so exactly one may be in flight per server. Without this, check_content_sync would
@@ -538,7 +545,7 @@ def _format_duration(seconds: float) -> str:
     return f"{seconds // 3600}h{(seconds % 3600) // 60:02}m"
 
 
-def _map_with_progress(pool, fn, items, label: str, lib_title: str, server_id: int) -> list:
+def _map_with_progress(pool, fn, items, label: str, lib_title: str, server_id: int, units=None) -> list:
     """pool.map, narrated on a timer.
 
     Reporting used to happen inside the result loop every 10% of items, which fails twice over on
@@ -546,8 +553,12 @@ def _map_with_progress(pool, fn, items, label: str, lib_title: str, server_id: i
     order*, so a single stalled item blocks all reporting while the other workers quietly finish
     thousands. Instead the wrapped function counts its own completions and a daemon thread reports
     on a fixed interval — so the line appears on schedule regardless of which item is slow, and
-    reflects work actually finished rather than work finished in order."""
-    total = len(items)
+    reflects work actually finished rather than work finished in order.
+
+    units maps an item to how many underlying things it stands for, so a batch of a hundred
+    episodes counts as a hundred rather than as one and progress still reads in episodes."""
+    unit_of = units or (lambda _: 1)
+    total = sum(unit_of(i) for i in items)
     if total == 0:
         return []
     # Below this a phase finishes quickly enough that the "Checking credits status for N …" line
@@ -564,7 +575,7 @@ def _map_with_progress(pool, fn, items, label: str, lib_title: str, server_id: i
             return fn(item)
         finally:
             with counter_lock:
-                done += 1
+                done += unit_of(item)
 
     started = time.monotonic()
     finished = threading.Event()
@@ -617,6 +628,43 @@ def _safe_credits_enabled(item) -> bool | None:
         return None
 
 
+def _credits_by_rating_key(plex, rating_keys: list[int], label: str, lib_title: str, server_id: int) -> dict[int, bool]:
+    """Credits status for every leaf item in a library, batched.
+
+    This used to be one Plex request per item, which is what made a full sweep an overnight job:
+    the per-item call goes through plexapi's fetchItem and pulls the heaviest metadata document
+    Plex will produce, purely to read one Marker element. Batching turns tens of thousands of those
+    into a few hundred cheap requests."""
+    if not rating_keys:
+        return {}
+
+    chunks = [
+        rating_keys[i : i + CREDITS_BATCH_SIZE] for i in range(0, len(rating_keys), CREDITS_BATCH_SIZE)
+    ]
+
+    def _chunk(chunk: list[int]) -> dict[int, bool]:
+        try:
+            return check_has_credits_bulk(plex, chunk)
+        except Exception:  # noqa: BLE001
+            # Retry this chunk one item at a time rather than writing off a hundred episodes as
+            # "no credits" because a single request failed.
+            logger.warning(
+                "Batched credits check failed for %d item(s) in %s — falling back to one at a time",
+                len(chunk),
+                lib_title,
+                extra={"server_id": server_id},
+            )
+            return {k: _safe_has_credits(plex, k) for k in chunk}
+
+    with ThreadPoolExecutor(max_workers=_CREDITS_BATCH_WORKERS) as pool:
+        results = _map_with_progress(pool, _chunk, chunks, label, lib_title, server_id, units=len)
+
+    merged: dict[int, bool] = {}
+    for result in results:
+        merged.update(result)
+    return merged
+
+
 def _safe_has_credits(plex, rating_key: int) -> bool:
     """False on failure rather than None: absent evidence of a marker, "no credits yet" is the
     conservative answer — it leaves the item eligible for a scan instead of hiding it."""
@@ -630,8 +678,19 @@ def _build_movie_rows(plex, server_id: int, lib: Library, section) -> list[Cache
     movies = list(section.all())
     logger.info("Checking credits status for %d movie(s) in %s...", len(movies), lib.title, extra={"server_id": server_id})
 
-    def _row(m) -> CachedItem:
-        return CachedItem(
+    has_credits = _credits_by_rating_key(
+        plex, [m.ratingKey for m in movies], "Movie credits checked", lib.title, server_id
+    )
+
+    # The enable/disable preference has no bulk equivalent — it's a separate per-item call — so it
+    # stays parallel-per-item. It's also much cheaper than the marker lookup used to be.
+    with ThreadPoolExecutor(max_workers=_CREDITS_CHECK_WORKERS) as pool:
+        enabled = _map_with_progress(
+            pool, _safe_credits_enabled, movies, "Movie settings checked", lib.title, server_id
+        )
+
+    return [
+        CachedItem(
             server_id=server_id,
             section_id=lib.section_id,
             rating_key=m.ratingKey,
@@ -639,12 +698,11 @@ def _build_movie_rows(plex, server_id: int, lib: Library, section) -> list[Cache
             title=m.title,
             type="movie",
             has_thumb=bool(getattr(m, "thumb", None)),
-            credits_enabled=_safe_credits_enabled(m),
-            has_credits=_safe_has_credits(plex, m.ratingKey),
+            credits_enabled=is_enabled,
+            has_credits=has_credits.get(m.ratingKey, False),
         )
-
-    with ThreadPoolExecutor(max_workers=_CREDITS_CHECK_WORKERS) as pool:
-        return _map_with_progress(pool, _row, movies, "Movies checked", lib.title, server_id)
+        for m, is_enabled in zip(movies, enabled)
+    ]
 
 
 def _build_show_rows(plex, server_id: int, lib: Library, section) -> list[CachedItem]:
@@ -693,17 +751,12 @@ def _build_show_rows(plex, server_id: int, lib: Library, section) -> list[Cached
     episodes = list(section.all(libtype="episode"))
     logger.info("Checking credits status for %d episode(s) in %s...", len(episodes), lib.title, extra={"server_id": server_id})
 
-    with ThreadPoolExecutor(max_workers=_CREDITS_CHECK_WORKERS) as pool:
-        episode_credits = _map_with_progress(
-            pool,
-            lambda ep: _safe_has_credits(plex, ep.ratingKey),
-            episodes,
-            "Episodes checked",
-            lib.title,
-            server_id,
-        )
+    episode_credits = _credits_by_rating_key(
+        plex, [ep.ratingKey for ep in episodes], "Episodes checked", lib.title, server_id
+    )
 
-    for ep, has_credits in zip(episodes, episode_credits):
+    for ep in episodes:
+        has_credits = episode_credits.get(ep.ratingKey, False)
         rows.append(
             CachedItem(
                 server_id=server_id,

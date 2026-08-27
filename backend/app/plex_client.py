@@ -174,15 +174,51 @@ def disable_item_credits(item) -> bool:
         return False
 
 
+# One request carries this many rating keys. Above ~50 the per-item cost is already flat (measured
+# at 50/100/200: 563/587/584 items per second), so this is chosen for a request whose URL and
+# response stay a sane size rather than for throughput.
+CREDITS_BATCH_SIZE = 100
+
+
 def check_has_credits(plex: PlexServer, rating_key: int) -> bool:
-    """Whether Plex has already generated a credits marker for this item — true per-item concept,
-    works for any leaf video (movie or episode). The one part of syncing that can't be answered
-    from a bulk listing: Plex only exposes markers via a full per-item fetch, never inline in bulk
-    results (confirmed empirically — bulk requests with includeMarkers=1 still come back with zero
-    Marker elements), so this is a real network round trip per item, meant to be run in parallel
-    across many items rather than called in a loop."""
+    """Whether Plex has already generated a credits marker for this one item.
+
+    Kept for single-item callers and as the per-item fallback when a batch fails. Prefer
+    check_has_credits_bulk for anything sweeping a library: this goes through plexapi's fetchItem,
+    whose default _INCLUDES asks Plex for chapters, bandwidths, geolocation and loudness ramps
+    along with the markers — the heaviest metadata document available, to read one element from."""
     item = plex.fetchItem(rating_key)
     return any(m.type == "credits" for m in (item.markers or []))
+
+
+def check_has_credits_bulk(plex: PlexServer, rating_keys: list[int]) -> dict[int, bool]:
+    """Credits-marker status for many items in a single request.
+
+    Plex accepts comma-separated rating keys on /library/metadata and honours includeMarkers there.
+    A previous comment in this file said bulk requests came back with zero Marker elements — that
+    was true, but of *library section listings*, which are a different endpoint. This one returns
+    them, and it is the difference between a sweep taking minutes and taking most of a day:
+    measured against a real library, 66 items/second one at a time versus 587 batched.
+
+    Note this deliberately doesn't go through plexapi's fetchItems, which treats keyword arguments
+    as filters to apply to the results rather than as query parameters — passing includeMarkers=1
+    there silently matches nothing and returns an empty list.
+
+    Keys Plex doesn't return (deleted between listing and checking, say) come back False, matching
+    what a per-item check would have concluded."""
+    if not rating_keys:
+        return {}
+
+    path = "/library/metadata/" + ",".join(str(k) for k in rating_keys)
+    data = plex.query(path, params={"includeMarkers": 1})
+
+    found = {}
+    for element in data:
+        key = element.attrib.get("ratingKey")
+        if key is None:
+            continue
+        found[int(key)] = any(m.attrib.get("type") == "credits" for m in element.findall("Marker"))
+    return {k: found.get(k, False) for k in rating_keys}
 
 
 def check_credits_enabled(item) -> bool | None:
