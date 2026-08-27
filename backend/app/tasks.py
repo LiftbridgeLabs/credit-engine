@@ -60,6 +60,11 @@ _CREDITS_CHECK_WORKERS = 8
 _CONTENT_SYNC_LOCK_TTL_SECONDS = 300
 _CONTENT_SYNC_HEARTBEAT_SECONDS = 60
 
+# How often a long phase reports progress. The episode pass runs for hours on a large library, so
+# this is the only evidence it's alive; frequent enough to be reassuring, rare enough that an
+# overnight run doesn't dominate the log table.
+_PROGRESS_INTERVAL_SECONDS = 60
+
 logger = logging.getLogger(__name__)
 
 
@@ -104,18 +109,23 @@ def _content_sync_lock(server_id: int):
     simply be given a long expiry."""
     client = redis.Redis.from_url(settings.redis_url)
     key = _content_sync_lock_key(server_id)
-    acquired = bool(
-        client.set(key, datetime.now(timezone.utc).isoformat(), nx=True, ex=_CONTENT_SYNC_LOCK_TTL_SECONDS)
-    )
+    held_since = datetime.now(timezone.utc).isoformat()
+    acquired = bool(client.set(key, held_since, nx=True, ex=_CONTENT_SYNC_LOCK_TTL_SECONDS))
 
     done = threading.Event()
 
     def _renew() -> None:
         # wait() returns True the moment the sync finishes, which ends the loop without waiting out
         # the remaining interval.
+        #
+        # SET rather than EXPIRE, so a lock deleted by hand while its sync is still running is put
+        # back. Clearing a lock is the documented way out of a stuck one, but on a live sync it
+        # only unblocks the scheduler to start a second full sweep alongside the first — both then
+        # competing for the same Plex server. A dead sync has no heartbeat, so deleting that one
+        # still works exactly as intended.
         while not done.wait(_CONTENT_SYNC_HEARTBEAT_SECONDS):
             try:
-                client.expire(key, _CONTENT_SYNC_LOCK_TTL_SECONDS)
+                client.set(key, held_since, ex=_CONTENT_SYNC_LOCK_TTL_SECONDS)
             except Exception:  # noqa: BLE001 — a lost heartbeat must not kill the sync it guards
                 return
 
@@ -529,44 +539,69 @@ def _format_duration(seconds: float) -> str:
 
 
 def _map_with_progress(pool, fn, items, label: str, lib_title: str, server_id: int) -> list:
-    """pool.map, narrated.
+    """pool.map, narrated on a timer.
 
-    The episode pass is one Plex round trip per item — tens of minutes on a large library, with a
-    single log line before it and nothing at all until it ends. A silent block that long is
-    indistinguishable from a hung sync, which is the one thing anyone actually wants to know while
-    one is running. Reports roughly every 10%, so a library of any size produces about ten lines
-    per phase rather than one per item."""
+    Reporting used to happen inside the result loop every 10% of items, which fails twice over on
+    the episode pass: 10% of 47k items is a very long first wait, and pool.map yields results *in
+    order*, so a single stalled item blocks all reporting while the other workers quietly finish
+    thousands. Instead the wrapped function counts its own completions and a daemon thread reports
+    on a fixed interval — so the line appears on schedule regardless of which item is slow, and
+    reflects work actually finished rather than work finished in order."""
     total = len(items)
     if total == 0:
         return []
-    # Below this, a phase finishes quickly enough that the "Checking credits status for N …" line
-    # already said everything useful, and one line per item would just be noise.
+    # Below this a phase finishes quickly enough that the "Checking credits status for N …" line
+    # already said everything useful.
     if total < 50:
         return list(pool.map(fn, items))
 
-    step = max(1, total // 10)
+    done = 0
+    counter_lock = threading.Lock()
+
+    def _counted(item):
+        nonlocal done
+        try:
+            return fn(item)
+        finally:
+            with counter_lock:
+                done += 1
+
     started = time.monotonic()
-    results = []
-    for done, value in enumerate(pool.map(fn, items), start=1):
-        results.append(value)
-        # Emit on each step boundary, and always on the last item — but skip a boundary that lands
-        # within one step of the end, which would otherwise print 100% twice.
-        if done != total and (done % step or total - done < step):
-            continue
+    finished = threading.Event()
+
+    def _report(final: bool = False) -> None:
+        with counter_lock:
+            completed = done
+        if completed == 0 and not final:
+            return
         elapsed = time.monotonic() - started
-        rate = done / elapsed if elapsed > 0 else 0
-        remaining = _format_duration((total - done) / rate) if rate > 0 else "?"
+        rate = completed / elapsed if elapsed > 0 else 0
         logger.info(
             "%s in %s: %d/%d (%d%%) — %s elapsed, ~%s left",
             label,
             lib_title,
-            done,
+            completed,
             total,
-            round(done * 100 / total),
+            # Floored, not rounded: 3999/4000 reporting "100%" while an item is still outstanding
+            # is precisely the false finish this reporting exists to avoid.
+            completed * 100 // total,
             _format_duration(elapsed),
-            remaining,
+            _format_duration((total - completed) / rate) if rate > 0 else "?",
             extra={"server_id": server_id},
         )
+
+    def _report_loop() -> None:
+        while not finished.wait(_PROGRESS_INTERVAL_SECONDS):
+            _report()
+
+    reporter = threading.Thread(target=_report_loop, name=f"sync-progress-{server_id}", daemon=True)
+    reporter.start()
+    try:
+        results = list(pool.map(_counted, items))
+    finally:
+        finished.set()
+        reporter.join(timeout=5)
+    _report(final=True)
     return results
 
 
