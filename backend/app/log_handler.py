@@ -9,21 +9,15 @@ from app.models import LogEntry
 # Plex library scan or a page of pagination in the UI would flood the log table with entries no one
 # asked to see. The root logger stays at DEBUG so app.* loggers pass everything through for the
 # "Debug" filter tier; these are the exceptions, dialed back to WARNING individually.
-# "celery" covers the worker's own per-task chatter, which is genuinely per-task: a single library
-# sync queues thousands of scans, and "Task received"/"succeeded" for each would bury the app's own
-# progress lines in the very view meant to show them (5 days of container stdout held ~19k
-# "received" lines). Its ERROR records — the "Task raised unexpected" tracebacks — still come
-# through, which is the part worth keeping.
-_QUIET_LOGGERS = [
-    "httpx",
-    "httpcore",
-    "urllib3",
-    "uvicorn.access",
-    "asyncio",
-    "celery",
-    "kombu",
-    "amqp",
-]
+_QUIET_LOGGERS = ["httpx", "httpcore", "urllib3", "uvicorn.access", "asyncio", "celery.utils.functional"]
+
+# Celery narrates every individual task, and one library sync queues thousands of them — left
+# alone, "Task received"/"succeeded" would bury the app's own progress lines in the very view meant
+# to show them (five days of container stdout held ~19k "received" lines). Filtered at the handler
+# instead of by lowering these loggers' levels, so `docker logs` keeps the full picture for
+# debugging and only the database-backed Logs page is trimmed. WARNING and above always passes —
+# that's where the "Task raised unexpected" tracebacks live, which are worth keeping.
+_DB_QUIET_PREFIXES = ("celery", "kombu", "amqp")
 
 
 class DatabaseLogHandler(logging.Handler):
@@ -32,6 +26,8 @@ class DatabaseLogHandler(logging.Handler):
     code was trying to log in the first place."""
 
     def emit(self, record: logging.LogRecord) -> None:
+        if record.levelno < logging.WARNING and record.name.startswith(_DB_QUIET_PREFIXES):
+            return
         try:
             message = self.format(record)
             db = SessionLocal()
