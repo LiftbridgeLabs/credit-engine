@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { ArrowLeft, ScrollText, Pause, Play, Trash2, Info } from "lucide-react";
 import { api, ApiError, type LogEntry, type LogLevel } from "../lib/api";
-import { Badge, Button, Card, ErrorBanner } from "../components/ui";
+import { Badge, Button, ErrorBanner } from "../components/ui";
 
 const LEVELS: LogLevel[] = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"];
 
@@ -14,13 +14,58 @@ const LEVEL_TONE: Record<LogLevel, "neutral" | "brand" | "warn" | "bad"> = {
   CRITICAL: "bad",
 };
 
+// Tuned for the console's own dark background, which it keeps in both themes — see the panel
+// below for why it isn't a Card.
 const LEVEL_TEXT_COLOR: Record<LogLevel, string> = {
-  DEBUG: "text-slate-500",
-  INFO: "text-slate-200",
-  WARNING: "text-amber-400",
-  ERROR: "text-red-400",
-  CRITICAL: "text-red-400",
+  DEBUG: "text-slate-400",
+  INFO: "text-slate-100",
+  WARNING: "text-amber-300",
+  ERROR: "text-red-300",
+  CRITICAL: "text-red-300",
 };
+
+// Anything longer than this, or containing newlines, is collapsed to its first line behind a
+// toggle. A single Celery traceback is ~60 lines and would otherwise push everything else out of
+// view — which is exactly what makes the interesting entry impossible to find.
+const COLLAPSE_OVER_CHARS = 200;
+
+function LogRow({ entry }: { entry: LogEntry }) {
+  const [expanded, setExpanded] = useState(false);
+  const long = entry.message.includes("\n") || entry.message.length > COLLAPSE_OVER_CHARS;
+  const firstLine = entry.message.split("\n", 1)[0];
+
+  return (
+    <div className="py-0.5 border-b border-slate-900/70 last:border-0">
+      <div className="flex gap-2 items-baseline">
+        <span className="text-slate-500 shrink-0 tabular-nums">
+          {new Date(entry.created_at).toLocaleTimeString()}
+        </span>
+        <span className="shrink-0">
+          <Badge tone={LEVEL_TONE[entry.level]}>{entry.level}</Badge>
+        </span>
+        <span className="text-slate-500 shrink-0">{entry.logger_name}</span>
+        <span className={`${LEVEL_TEXT_COLOR[entry.level]} ${long ? "truncate" : "break-words"} min-w-0`}>
+          {long ? firstLine : entry.message}
+        </span>
+        {long && (
+          <button
+            onClick={() => setExpanded((v) => !v)}
+            className="shrink-0 ml-auto text-slate-400 hover:text-slate-200 underline decoration-dotted"
+          >
+            {expanded ? "hide" : "details"}
+          </button>
+        )}
+      </div>
+      {long && expanded && (
+        // whitespace-pre-wrap keeps a traceback's line structure; break-words wraps only at word
+        // boundaries, where break-all used to split identifiers mid-character into noise.
+        <pre className={`${LEVEL_TEXT_COLOR[entry.level]} whitespace-pre-wrap break-words mt-1 mb-2 pl-2 border-l-2 border-slate-700`}>
+          {entry.message}
+        </pre>
+      )}
+    </div>
+  );
+}
 
 // Keep the rendered list bounded — a long overnight session at Debug level could otherwise grow
 // the DOM without limit even though the underlying table is already capped by retention settings.
@@ -102,6 +147,8 @@ export default function LogsPage() {
         <p className="text-sm text-slate-500">
           Everything CreditEngine does across every server — bootstraps, rule applies, scans, and webhook
           activity. Updates live every couple seconds; pause to freeze the view without losing anything.
+          Almost everything is logged at INFO — Debug adds only a couple of internal messages, so it will
+          look much the same.
         </p>
       </div>
 
@@ -146,22 +193,20 @@ export default function LogsPage() {
         </div>
       )}
 
-      <Card className="p-0 overflow-hidden bg-slate-950 border-slate-800">
+      {/* Deliberately not a Card: Card hardcodes `bg-white dark:bg-slate-900`, and a `bg-slate-950`
+          passed through className competes with it in the same Tailwind layer rather than
+          overriding it — so this panel used to render white in light mode while its text colours
+          were chosen for a dark background, which is what made it unreadable. A console stays a
+          console in both themes. */}
+      <div className="rounded-xl border border-slate-800 bg-slate-950 shadow-sm overflow-hidden">
         <div className="max-h-[65vh] overflow-y-auto px-4 py-3 font-mono text-xs leading-relaxed">
           {entries.length === 0 && <p className="text-slate-500">No log entries at this level yet.</p>}
           {entries.map((e) => (
-            <div key={e.id} className="flex gap-2 py-0.5">
-              <span className="text-slate-600 shrink-0">{new Date(e.created_at).toLocaleTimeString()}</span>
-              <span className="shrink-0">
-                <Badge tone={LEVEL_TONE[e.level]}>{e.level}</Badge>
-              </span>
-              <span className="text-slate-600 shrink-0">{e.logger_name}</span>
-              <span className={`${LEVEL_TEXT_COLOR[e.level]} break-all`}>{e.message}</span>
-            </div>
+            <LogRow key={e.id} entry={e} />
           ))}
           <div ref={bottomRef} />
         </div>
-      </Card>
+      </div>
     </div>
   );
 }

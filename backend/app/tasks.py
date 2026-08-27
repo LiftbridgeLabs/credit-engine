@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -518,6 +519,57 @@ def prune_logs() -> None:
         db.close()
 
 
+def _format_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02}m"
+
+
+def _map_with_progress(pool, fn, items, label: str, lib_title: str, server_id: int) -> list:
+    """pool.map, narrated.
+
+    The episode pass is one Plex round trip per item — tens of minutes on a large library, with a
+    single log line before it and nothing at all until it ends. A silent block that long is
+    indistinguishable from a hung sync, which is the one thing anyone actually wants to know while
+    one is running. Reports roughly every 10%, so a library of any size produces about ten lines
+    per phase rather than one per item."""
+    total = len(items)
+    if total == 0:
+        return []
+    # Below this, a phase finishes quickly enough that the "Checking credits status for N …" line
+    # already said everything useful, and one line per item would just be noise.
+    if total < 50:
+        return list(pool.map(fn, items))
+
+    step = max(1, total // 10)
+    started = time.monotonic()
+    results = []
+    for done, value in enumerate(pool.map(fn, items), start=1):
+        results.append(value)
+        # Emit on each step boundary, and always on the last item — but skip a boundary that lands
+        # within one step of the end, which would otherwise print 100% twice.
+        if done != total and (done % step or total - done < step):
+            continue
+        elapsed = time.monotonic() - started
+        rate = done / elapsed if elapsed > 0 else 0
+        remaining = _format_duration((total - done) / rate) if rate > 0 else "?"
+        logger.info(
+            "%s in %s: %d/%d (%d%%) — %s elapsed, ~%s left",
+            label,
+            lib_title,
+            done,
+            total,
+            round(done * 100 / total),
+            _format_duration(elapsed),
+            remaining,
+            extra={"server_id": server_id},
+        )
+    return results
+
+
 def _safe_credits_enabled(item) -> bool | None:
     """check_credits_enabled already returns None for items that don't expose the preference at
     all; this additionally swallows transport-level failures (a timeout, a Plex hiccup partway
@@ -557,7 +609,7 @@ def _build_movie_rows(plex, server_id: int, lib: Library, section) -> list[Cache
         )
 
     with ThreadPoolExecutor(max_workers=_CREDITS_CHECK_WORKERS) as pool:
-        return list(pool.map(_row, movies))
+        return _map_with_progress(pool, _row, movies, "Movies checked", lib.title, server_id)
 
 
 def _build_show_rows(plex, server_id: int, lib: Library, section) -> list[CachedItem]:
@@ -569,7 +621,10 @@ def _build_show_rows(plex, server_id: int, lib: Library, section) -> list[Cached
     # Cheap relative to the episode pass below — one preference read per show, no per-episode
     # equivalent since Episode doesn't expose the preference at all.
     with ThreadPoolExecutor(max_workers=_CREDITS_CHECK_WORKERS) as pool:
-        show_enabled = dict(zip((s.ratingKey for s in shows), pool.map(_safe_credits_enabled, shows)))
+        enabled_values = _map_with_progress(
+            pool, _safe_credits_enabled, shows, "Shows checked", lib.title, server_id
+        )
+    show_enabled = dict(zip((s.ratingKey for s in shows), enabled_values))
 
     for s in shows:
         rows.append(
@@ -604,7 +659,14 @@ def _build_show_rows(plex, server_id: int, lib: Library, section) -> list[Cached
     logger.info("Checking credits status for %d episode(s) in %s...", len(episodes), lib.title, extra={"server_id": server_id})
 
     with ThreadPoolExecutor(max_workers=_CREDITS_CHECK_WORKERS) as pool:
-        episode_credits = list(pool.map(lambda ep: _safe_has_credits(plex, ep.ratingKey), episodes))
+        episode_credits = _map_with_progress(
+            pool,
+            lambda ep: _safe_has_credits(plex, ep.ratingKey),
+            episodes,
+            "Episodes checked",
+            lib.title,
+            server_id,
+        )
 
     for ep, has_credits in zip(episodes, episode_credits):
         rows.append(
@@ -679,6 +741,7 @@ def sync_library_contents(server_id: int) -> None:
             )
             plex = connect(server.base_url, server.token)
 
+            sync_started = time.monotonic()
             total = 0
             failed = []
             for lib in libraries:
@@ -720,7 +783,13 @@ def sync_library_contents(server_id: int) -> None:
                     extra={"server_id": server_id},
                 )
             else:
-                logger.info("Library sync complete for %s: %d items cached", server.name, total, extra={"server_id": server_id})
+                logger.info(
+                    "Library sync complete for %s: %d items cached in %s",
+                    server.name,
+                    total,
+                    _format_duration(time.monotonic() - sync_started),
+                    extra={"server_id": server_id},
+                )
     finally:
         db.close()
 
