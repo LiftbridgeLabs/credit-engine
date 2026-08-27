@@ -115,6 +115,8 @@ export interface ServerConnection {
   webhook_secret: string;
   webhook_verified_at: string | null;
   created_at: string;
+  content_sync_running: boolean;
+  content_sync_started_at: string | null;
 }
 
 export interface Library {

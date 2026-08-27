@@ -9,7 +9,12 @@ from app.models import ServerConnection, User
 from app.plex_client import connect, get_diagnostics, set_global_credits_behavior
 from app.routers.libraries import sync_libraries_now
 from app.security import get_current_user
-from app.tasks import bootstrap_credits_control, content_sync_started_at, sync_library_contents
+from app.tasks import (
+    bootstrap_credits_control,
+    content_sync_started_at,
+    request_content_sync_cancel,
+    sync_library_contents,
+)
 
 router = APIRouter(prefix="/servers", tags=["servers"])
 
@@ -56,9 +61,21 @@ def link_server(
     return server
 
 
+def _with_sync_state(server: ServerConnection) -> dict:
+    """A server plus whether a content sync is running on it. Read from the lock rather than stored
+    on the row: the fact is owned by whichever worker holds it, and a database column would go
+    stale the moment a worker died without clearing it."""
+    started_at = content_sync_started_at(server.id)
+    data = {c.name: getattr(server, c.name) for c in server.__table__.columns}
+    data["content_sync_running"] = started_at is not None
+    data["content_sync_started_at"] = started_at.isoformat() if started_at else None
+    return data
+
+
 @router.get("")
 def list_servers(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    return db.query(ServerConnection).filter_by(owner_id=current_user.id).all()
+    servers = db.query(ServerConnection).filter_by(owner_id=current_user.id).all()
+    return [_with_sync_state(s) for s in servers]
 
 
 @router.get("/{server_id}")
@@ -145,3 +162,14 @@ def sync_content(server_id: int, current_user: User = Depends(get_current_user),
         return {"status": "already_running", "started_at": started_at.isoformat()}
     sync_library_contents.delay(server_id)
     return {"status": "sync_started"}
+
+
+@router.post("/{server_id}/sync-content/cancel")
+def cancel_sync_content(server_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Stop a running content sync, or clear a lock left behind by one that died.
+
+    Both used to require deleting a Redis key from a shell, which is not a reasonable thing to ask
+    of anyone using the app. See tasks.request_content_sync_cancel for why stopping a live sync
+    can't just be that delete."""
+    server = _get_owned_server(server_id, current_user, db)
+    return {"status": request_content_sync_cancel(server.id)}

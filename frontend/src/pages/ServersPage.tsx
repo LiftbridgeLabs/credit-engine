@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { Plus, RefreshCw, Server, Webhook, ChevronDown, ChevronRight, Trash2 } from "lucide-react";
+import { Plus, RefreshCw, Server, Square, Webhook, ChevronDown, ChevronRight, Trash2 } from "lucide-react";
 import { api, ApiError, type PlexDiscoveredServer, type PlexServerConnection, type ServerConnection } from "../lib/api";
 import { Badge, Button, Card, ErrorBanner, Input, Spinner } from "../components/ui";
 import { EmptyState } from "../components/EmptyState";
@@ -27,12 +27,39 @@ export default function ServersPage() {
     load();
   }, []);
 
+  // While a sync is running the only thing that changes is elsewhere — on a worker — so the page
+  // has to ask. Polls only while there's something to watch, and stops once nothing is running.
+  useEffect(() => {
+    if (!servers?.some((s) => s.content_sync_running)) return;
+    const interval = window.setInterval(load, 5000);
+    return () => window.clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [servers]);
+
+  async function stopSync(e: React.MouseEvent, serverId: number) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!confirm("Stop the running library sync? Nothing already cached is lost — a sync that stops early leaves the previous snapshot in place.")) return;
+    try {
+      const res = await api.post<{ status: string }>(`/servers/${serverId}/sync-content/cancel`);
+      toast(
+        res.status === "cancelling"
+          ? "Stopping the sync — it finishes the batch it's on, then unwinds"
+          : "Nothing was running; cleared the leftover lock",
+      );
+      load();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : "Failed to stop the sync");
+    }
+  }
+
   async function syncContent(e: React.MouseEvent, serverId: number) {
     e.preventDefault(); // the card itself is a Link — don't navigate when clicking this button
     e.stopPropagation();
     setSyncing((prev) => new Set(prev).add(serverId));
     try {
       const res = await api.post<{ status: string; started_at?: string }>(`/servers/${serverId}/sync-content`);
+      load();
       if (res.status === "already_running") {
         // Saying since when matters: a start time from hours ago on a library that takes minutes
         // is the difference between "be patient" and "something is stuck".
@@ -155,14 +182,27 @@ export default function ServersPage() {
                     <Button
                       size="sm"
                       variant="secondary"
-                      icon={<RefreshCw className={`h-3 w-3 ${syncing.has(s.id) ? "animate-spin" : ""}`} />}
+                      icon={<RefreshCw className={`h-3 w-3 ${syncing.has(s.id) || s.content_sync_running ? "animate-spin" : ""}`} />}
                       onClick={(e) => syncContent(e, s.id)}
-                      disabled={syncing.has(s.id)}
+                      disabled={syncing.has(s.id) || s.content_sync_running}
                       className="ml-auto"
                       title="Rebuilds the cached contents of every included library — titles, art references and credits status — so new shows and movies appear in Browse. Runs automatically on an interval; this is the don't-wait-for-it button."
                     >
-                      Sync content
+                      {s.content_sync_running
+                        ? `Syncing since ${new Date(s.content_sync_started_at!).toLocaleTimeString()}`
+                        : "Sync content"}
                     </Button>
+                    {s.content_sync_running && (
+                      <Button
+                        size="sm"
+                        variant="danger"
+                        icon={<Square className="h-3 w-3" />}
+                        onClick={(e) => stopSync(e, s.id)}
+                        title="Stops the running sync. Also clears a lock left behind by a sync that was interrupted — which otherwise blocks starting a new one until it expires."
+                      >
+                        Stop
+                      </Button>
+                    )}
                     <Button
                       size="sm"
                       variant="ghost"

@@ -72,11 +72,89 @@ _CONTENT_SYNC_HEARTBEAT_SECONDS = 60
 # overnight run doesn't dominate the log table.
 _PROGRESS_INTERVAL_SECONDS = 60
 
+# How often a running sync checks whether it's been asked to stop. Short enough that pressing the
+# button feels like it did something, far too rare to matter as load.
+_CANCEL_POLL_SECONDS = 3
+
 logger = logging.getLogger(__name__)
+
+
+class SyncCancelled(Exception):
+    """Raised inside a running sync once someone has asked it to stop."""
 
 
 def _content_sync_lock_key(server_id: int) -> str:
     return f"creditengine:content-sync:{server_id}"
+
+
+def _content_sync_cancel_key(server_id: int) -> str:
+    return f"creditengine:content-sync-cancel:{server_id}"
+
+
+def request_content_sync_cancel(server_id: int) -> str:
+    """Ask a running sync to stop, and clear the lock if there is nothing running to stop.
+
+    Two situations look identical from outside — a sync genuinely working through a large library,
+    and a lock left behind by a worker that was killed — and until now the only way out of either
+    was deleting a Redis key by hand. Deleting the key is also the wrong tool for the first case:
+    the heartbeat puts it straight back, by design, so that clearing a lock can't start a second
+    sweep alongside the first.
+
+    So this sets a cancel flag the running sync polls for, and deletes the lock. A live sync sees
+    the flag within seconds and unwinds cleanly, releasing the lock itself; an abandoned lock has
+    nothing to restore it and is simply gone. Returns what happened, for the caller to report."""
+    client = redis.Redis.from_url(settings.redis_url)
+    try:
+        was_locked = bool(client.exists(_content_sync_lock_key(server_id)))
+        # Outlives any plausible unwind, and expires on its own so a stale flag can never
+        # silently cancel a future sync.
+        client.set(_content_sync_cancel_key(server_id), "1", ex=600)
+        client.delete(_content_sync_lock_key(server_id))
+    finally:
+        client.close()
+    return "cancelling" if was_locked else "nothing_running"
+
+
+def _clear_content_sync_cancel(server_id: int) -> None:
+    client = redis.Redis.from_url(settings.redis_url)
+    try:
+        client.delete(_content_sync_cancel_key(server_id))
+    finally:
+        client.close()
+
+
+def _is_content_sync_cancelled(server_id: int) -> bool:
+    client = redis.Redis.from_url(settings.redis_url)
+    try:
+        return bool(client.exists(_content_sync_cancel_key(server_id)))
+    except Exception:  # noqa: BLE001 — an unreachable Redis must not abort the sync
+        return False
+    finally:
+        client.close()
+
+
+@contextmanager
+def _cancellation_watch(server_id: int):
+    """Yields an Event that becomes set once a stop has been requested.
+
+    Polled on a background thread rather than checked inline: the flag lives in Redis, and a check
+    per item would add a round trip to work that is otherwise batched a hundred at a time."""
+    cancelled = threading.Event()
+    stop = threading.Event()
+
+    def _watch() -> None:
+        while not stop.wait(_CANCEL_POLL_SECONDS):
+            if _is_content_sync_cancelled(server_id):
+                cancelled.set()
+                return
+
+    watcher = threading.Thread(target=_watch, name=f"content-sync-cancel-{server_id}", daemon=True)
+    watcher.start()
+    try:
+        yield cancelled
+    finally:
+        stop.set()
+        watcher.join(timeout=5)
 
 
 def is_content_sync_running(server_id: int) -> bool:
@@ -545,7 +623,7 @@ def _format_duration(seconds: float) -> str:
     return f"{seconds // 3600}h{(seconds % 3600) // 60:02}m"
 
 
-def _map_with_progress(pool, fn, items, label: str, lib_title: str, server_id: int, units=None) -> list:
+def _map_with_progress(pool, fn, items, label: str, lib_title: str, server_id: int, units=None, cancelled=None) -> list:
     """pool.map, narrated on a timer.
 
     Reporting used to happen inside the result loop every 10% of items, which fails twice over on
@@ -571,6 +649,11 @@ def _map_with_progress(pool, fn, items, label: str, lib_title: str, server_id: i
 
     def _counted(item):
         nonlocal done
+        # Checked before starting rather than interrupting work in flight: whatever is already
+        # running finishes, and everything still queued is skipped, so a cancel unwinds within
+        # about one batch instead of leaving a half-written library behind.
+        if cancelled is not None and cancelled.is_set():
+            raise SyncCancelled()
         try:
             return fn(item)
         finally:
@@ -628,7 +711,7 @@ def _safe_credits_enabled(item) -> bool | None:
         return None
 
 
-def _credits_by_rating_key(plex, rating_keys: list[int], label: str, lib_title: str, server_id: int) -> dict[int, bool]:
+def _credits_by_rating_key(plex, rating_keys: list[int], label: str, lib_title: str, server_id: int, cancelled=None) -> dict[int, bool]:
     """Credits status for every leaf item in a library, batched.
 
     This used to be one Plex request per item, which is what made a full sweep an overnight job:
@@ -657,7 +740,9 @@ def _credits_by_rating_key(plex, rating_keys: list[int], label: str, lib_title: 
             return {k: _safe_has_credits(plex, k) for k in chunk}
 
     with ThreadPoolExecutor(max_workers=_CREDITS_BATCH_WORKERS) as pool:
-        results = _map_with_progress(pool, _chunk, chunks, label, lib_title, server_id, units=len)
+        results = _map_with_progress(
+            pool, _chunk, chunks, label, lib_title, server_id, units=len, cancelled=cancelled
+        )
 
     merged: dict[int, bool] = {}
     for result in results:
@@ -674,19 +759,20 @@ def _safe_has_credits(plex, rating_key: int) -> bool:
         return False
 
 
-def _build_movie_rows(plex, server_id: int, lib: Library, section) -> list[CachedItem]:
+def _build_movie_rows(plex, server_id: int, lib: Library, section, cancelled=None) -> list[CachedItem]:
     movies = list(section.all())
     logger.info("Checking credits status for %d movie(s) in %s...", len(movies), lib.title, extra={"server_id": server_id})
 
     has_credits = _credits_by_rating_key(
-        plex, [m.ratingKey for m in movies], "Movie credits checked", lib.title, server_id
+        plex, [m.ratingKey for m in movies], "Movie credits checked", lib.title, server_id, cancelled
     )
 
     # The enable/disable preference has no bulk equivalent — it's a separate per-item call — so it
     # stays parallel-per-item. It's also much cheaper than the marker lookup used to be.
     with ThreadPoolExecutor(max_workers=_CREDITS_CHECK_WORKERS) as pool:
         enabled = _map_with_progress(
-            pool, _safe_credits_enabled, movies, "Movie settings checked", lib.title, server_id
+            pool, _safe_credits_enabled, movies, "Movie settings checked", lib.title, server_id,
+            cancelled=cancelled,
         )
 
     return [
@@ -705,7 +791,7 @@ def _build_movie_rows(plex, server_id: int, lib: Library, section) -> list[Cache
     ]
 
 
-def _build_show_rows(plex, server_id: int, lib: Library, section) -> list[CachedItem]:
+def _build_show_rows(plex, server_id: int, lib: Library, section, cancelled=None) -> list[CachedItem]:
     rows: list[CachedItem] = []
 
     shows = list(section.all(libtype="show"))
@@ -715,7 +801,7 @@ def _build_show_rows(plex, server_id: int, lib: Library, section) -> list[Cached
     # equivalent since Episode doesn't expose the preference at all.
     with ThreadPoolExecutor(max_workers=_CREDITS_CHECK_WORKERS) as pool:
         enabled_values = _map_with_progress(
-            pool, _safe_credits_enabled, shows, "Shows checked", lib.title, server_id
+            pool, _safe_credits_enabled, shows, "Shows checked", lib.title, server_id, cancelled=cancelled
         )
     show_enabled = dict(zip((s.ratingKey for s in shows), enabled_values))
 
@@ -752,7 +838,7 @@ def _build_show_rows(plex, server_id: int, lib: Library, section) -> list[Cached
     logger.info("Checking credits status for %d episode(s) in %s...", len(episodes), lib.title, extra={"server_id": server_id})
 
     episode_credits = _credits_by_rating_key(
-        plex, [ep.ratingKey for ep in episodes], "Episodes checked", lib.title, server_id
+        plex, [ep.ratingKey for ep in episodes], "Episodes checked", lib.title, server_id, cancelled
     )
 
     for ep in episodes:
@@ -820,6 +906,7 @@ def sync_library_contents(server_id: int) -> None:
                 logger.warning("Library sync requested for %s but no libraries are included", server.name, extra={"server_id": server_id})
                 return
 
+            _clear_content_sync_cancel(server_id)
             logger.info(
                 "Library sync starting for %s: %d included librar%s",
                 server.name,
@@ -829,57 +916,89 @@ def sync_library_contents(server_id: int) -> None:
             )
             plex = connect(server.base_url, server.token)
 
-            sync_started = time.monotonic()
-            total = 0
-            failed = []
-            for lib in libraries:
-                try:
-                    section = plex.library.sectionByID(lib.section_id)
-                    # Build the replacement set before touching what's already cached — this is the
-                    # slow, network-bound part, and nothing is thrown away until there's something
-                    # complete to put in its place.
-                    rows = []
-                    if section.type == "movie":
-                        rows = _build_movie_rows(plex, server_id, lib, section)
-                    elif section.type == "show":
-                        rows = _build_show_rows(plex, server_id, lib, section)
-
-                    db.query(CachedItem).filter_by(server_id=server_id, section_id=lib.section_id).delete()
-                    db.add_all(rows)
-                    # Only advanced once this library has actually been rebuilt, so a failure leaves
-                    # it looking stale to check_content_sync and it gets retried on the next pass.
-                    lib.content_synced_at = datetime.now(timezone.utc)
-                    db.commit()
-                    total += len(rows)
-                except Exception as exc:  # noqa: BLE001 — one library shouldn't sink the others
-                    db.rollback()
-                    failed.append(lib.title)
-                    logger.error(
-                        "Library sync failed for %s: %s",
-                        lib.title,
-                        exc,
-                        extra={"server_id": server_id},
-                    )
-
-            if failed:
-                logger.warning(
-                    "Library sync for %s: %d items cached, %d library/libraries failed and kept their previous snapshot: %s",
-                    server.name,
-                    total,
-                    len(failed),
-                    ", ".join(failed),
-                    extra={"server_id": server_id},
-                )
-            else:
-                logger.info(
-                    "Library sync complete for %s: %d items cached in %s",
-                    server.name,
-                    total,
-                    _format_duration(time.monotonic() - sync_started),
-                    extra={"server_id": server_id},
-                )
+            try:
+                with _cancellation_watch(server_id) as cancelled:
+                    _sync_libraries(db, server, libraries, plex, cancelled)
+            finally:
+                # Whatever happened, the next sync must not inherit this one's stop request.
+                _clear_content_sync_cancel(server_id)
     finally:
         db.close()
+
+
+def _sync_libraries(db: Session, server: ServerConnection, libraries: list[Library], plex, cancelled) -> None:
+    """The rebuild itself, split out so the cancellation watch can be a plain `with` — the thread
+    it starts has to be stopped on every path out of here, including an unexpected one."""
+    server_id = server.id
+    sync_started = time.monotonic()
+    total = 0
+    failed = []
+    stopped_early = False
+    for lib in libraries:
+        if cancelled.is_set():
+            stopped_early = True
+            break
+        try:
+            section = plex.library.sectionByID(lib.section_id)
+            # Build the replacement set before touching what's already cached — this is the
+            # slow, network-bound part, and nothing is thrown away until there's something
+            # complete to put in its place.
+            rows = []
+            if section.type == "movie":
+                rows = _build_movie_rows(plex, server_id, lib, section, cancelled)
+            elif section.type == "show":
+                rows = _build_show_rows(plex, server_id, lib, section, cancelled)
+
+            db.query(CachedItem).filter_by(server_id=server_id, section_id=lib.section_id).delete()
+            db.add_all(rows)
+            # Only advanced once this library has actually been rebuilt, so a failure leaves
+            # it looking stale to check_content_sync and it gets retried on the next pass.
+            lib.content_synced_at = datetime.now(timezone.utc)
+            db.commit()
+            total += len(rows)
+        except SyncCancelled:
+            # Nothing committed for this library, so its previous snapshot stands intact —
+            # a cancelled sync leaves the cache exactly as it found it rather than half
+            # rebuilt.
+            db.rollback()
+            stopped_early = True
+            break
+        except Exception as exc:  # noqa: BLE001 — one library shouldn't sink the others
+            db.rollback()
+            failed.append(lib.title)
+            logger.error(
+                "Library sync failed for %s: %s",
+                lib.title,
+                exc,
+                extra={"server_id": server_id},
+            )
+
+    if stopped_early:
+        logger.warning(
+            "Library sync stopped for %s after %s: %d item(s) cached before it was cancelled",
+            server.name,
+            _format_duration(time.monotonic() - sync_started),
+            total,
+            extra={"server_id": server_id},
+        )
+    elif failed:
+        logger.warning(
+            "Library sync for %s: %d items cached, %d library/libraries failed and kept their previous snapshot: %s",
+            server.name,
+            total,
+            len(failed),
+            ", ".join(failed),
+            extra={"server_id": server_id},
+        )
+    else:
+        logger.info(
+            "Library sync complete for %s: %d items cached in %s",
+            server.name,
+            total,
+            _format_duration(time.monotonic() - sync_started),
+            extra={"server_id": server_id},
+        )
+
 
 
 @celery_app.task(name="app.tasks.check_content_sync")
