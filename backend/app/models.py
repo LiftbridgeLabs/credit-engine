@@ -85,8 +85,11 @@ class Library(Base):
     title: Mapped[str] = mapped_column(String)
     type: Mapped[str] = mapped_column(String)  # "movie" | "show"
     included: Mapped[bool] = mapped_column(Boolean, default=False)
-    # Null until the "Sync" button on the Servers page is used at least once — browse endpoints fall
-    # back to live Plex calls until then, so browsing still works, just without the cache's speed.
+    # Null until this library's contents have been synced at least once (the "Sync" button on the
+    # Servers page, or tasks.check_content_sync's interval pass) — browse endpoints fall back to
+    # live Plex calls until then, so browsing still works, just without the cache's speed.
+    # Doubles as the staleness clock check_content_sync reads, so it's only ever advanced for a
+    # library that genuinely finished rebuilding.
     content_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     server: Mapped["ServerConnection"] = relationship(back_populates="libraries")
@@ -162,8 +165,8 @@ class LogEntry(Base):
 
 class CachedItem(Base):
     """A lightweight snapshot of one item's position in the library tree (title, type, parent,
-    ordering) — populated by the manual "Sync" button on the Servers page (app/tasks.py's
-    sync_library_contents), not touched automatically. Deliberately just metadata, a few hundred
+    ordering) — populated by app/tasks.py's sync_library_contents, on demand from the "Sync" button
+    on the Servers page and on an interval via check_content_sync. Deliberately just metadata, a few hundred
     bytes a row even for a huge library — actual image bytes are never stored here or anywhere in
     the DB; see the /thumb proxy endpoint, which streams straight from Plex on request instead."""
 

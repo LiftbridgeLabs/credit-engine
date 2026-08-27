@@ -32,8 +32,12 @@ export default function ServersPage() {
     e.stopPropagation();
     setSyncing((prev) => new Set(prev).add(serverId));
     try {
-      await api.post(`/servers/${serverId}/sync-content`);
-      toast("Library sync started — running in the background, can take a while on a large library");
+      const res = await api.post<{ status: string }>(`/servers/${serverId}/sync-content`);
+      toast(
+        res.status === "already_running"
+          ? "A library sync is already running for this server — leaving it to finish"
+          : "Library sync started — running in the background, can take a while on a large library",
+      );
     } catch (err) {
       toast(err instanceof ApiError ? err.message : "Failed to start sync");
     } finally {

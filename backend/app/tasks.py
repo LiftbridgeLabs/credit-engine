@@ -1,11 +1,14 @@
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
+import redis
 from croniter import croniter
 from sqlalchemy.orm import Session
 
 from app.celery_app import celery_app
+from app.config import settings
 from app.db import SessionLocal
 from app.models import (
     AppSettings,
@@ -40,7 +43,45 @@ from app.plex_client import (
 # Plex server (playback, other scans), and Plex itself has to serve every one of these requests.
 _CREDITS_CHECK_WORKERS = 8
 
+# A content sync is long (one Plex round trip per movie/episode) and rebuilds each library's rows
+# wholesale, so exactly one may be in flight per server. Without this, check_content_sync would
+# queue a fresh one every time it ran while a multi-hour sync was still going — content_synced_at
+# isn't advanced until a library finishes, so the server stays "stale" for the whole run — and they
+# would stack until the worker pool was doing nothing else. The TTL is a backstop for a worker
+# killed mid-sync, which would otherwise hold the lock forever.
+_CONTENT_SYNC_LOCK_TTL_SECONDS = 12 * 60 * 60
+
 logger = logging.getLogger(__name__)
+
+
+def _content_sync_lock_key(server_id: int) -> str:
+    return f"creditengine:content-sync:{server_id}"
+
+
+def is_content_sync_running(server_id: int) -> bool:
+    """Best-effort read of the lock below, so the API can answer "already running" rather than
+    cheerfully reporting a second sync started when it's really going to be dropped on arrival."""
+    client = redis.Redis.from_url(settings.redis_url)
+    try:
+        return bool(client.exists(_content_sync_lock_key(server_id)))
+    finally:
+        client.close()
+
+
+@contextmanager
+def _content_sync_lock(server_id: int):
+    """Yields True if this caller holds the server's sync lock, False if someone else already does.
+    Deliberately not a wait-then-proceed lock: a queued duplicate has nothing useful to add by the
+    time the one ahead of it finishes, so it's dropped instead."""
+    client = redis.Redis.from_url(settings.redis_url)
+    key = _content_sync_lock_key(server_id)
+    acquired = bool(client.set(key, "1", nx=True, ex=_CONTENT_SYNC_LOCK_TTL_SECONDS))
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            client.delete(key)
+        client.close()
 
 
 def _is_due(schedule_cron: str, last_run_at: datetime | None, now: datetime) -> bool:
@@ -427,10 +468,119 @@ def prune_logs() -> None:
         db.close()
 
 
+def _safe_credits_enabled(item) -> bool | None:
+    """check_credits_enabled already returns None for items that don't expose the preference at
+    all; this additionally swallows transport-level failures (a timeout, a Plex hiccup partway
+    through a sweep of thousands of items) so one bad item degrades to "unknown" instead of taking
+    the whole library's sync down with it. These run inside a ThreadPoolExecutor whose results are
+    consumed lazily, so an escaping exception surfaces far from the item that caused it."""
+    try:
+        return check_credits_enabled(item)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _safe_has_credits(plex, rating_key: int) -> bool:
+    """False on failure rather than None: absent evidence of a marker, "no credits yet" is the
+    conservative answer — it leaves the item eligible for a scan instead of hiding it."""
+    try:
+        return check_has_credits(plex, rating_key)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _build_movie_rows(plex, server_id: int, lib: Library, section) -> list[CachedItem]:
+    movies = list(section.all())
+    logger.info("Checking credits status for %d movie(s) in %s...", len(movies), lib.title, extra={"server_id": server_id})
+
+    def _row(m) -> CachedItem:
+        return CachedItem(
+            server_id=server_id,
+            section_id=lib.section_id,
+            rating_key=m.ratingKey,
+            parent_rating_key=None,
+            title=m.title,
+            type="movie",
+            has_thumb=bool(getattr(m, "thumb", None)),
+            credits_enabled=_safe_credits_enabled(m),
+            has_credits=_safe_has_credits(plex, m.ratingKey),
+        )
+
+    with ThreadPoolExecutor(max_workers=_CREDITS_CHECK_WORKERS) as pool:
+        return list(pool.map(_row, movies))
+
+
+def _build_show_rows(plex, server_id: int, lib: Library, section) -> list[CachedItem]:
+    rows: list[CachedItem] = []
+
+    shows = list(section.all(libtype="show"))
+    logger.info("Checking credits status for %d show(s) in %s...", len(shows), lib.title, extra={"server_id": server_id})
+
+    # Cheap relative to the episode pass below — one preference read per show, no per-episode
+    # equivalent since Episode doesn't expose the preference at all.
+    with ThreadPoolExecutor(max_workers=_CREDITS_CHECK_WORKERS) as pool:
+        show_enabled = dict(zip((s.ratingKey for s in shows), pool.map(_safe_credits_enabled, shows)))
+
+    for s in shows:
+        rows.append(
+            CachedItem(
+                server_id=server_id,
+                section_id=lib.section_id,
+                rating_key=s.ratingKey,
+                parent_rating_key=None,
+                title=s.title,
+                type="show",
+                has_thumb=bool(getattr(s, "thumb", None)),
+                credits_enabled=show_enabled.get(s.ratingKey),
+            )
+        )
+    for se in section.all(libtype="season"):
+        rows.append(
+            CachedItem(
+                server_id=server_id,
+                section_id=lib.section_id,
+                rating_key=se.ratingKey,
+                parent_rating_key=se.parentRatingKey,
+                title=se.title,
+                type="season",
+                index=se.index,
+                season_number=se.index,
+                has_thumb=bool(getattr(se, "thumb", None)),
+                credits_enabled=show_enabled.get(se.parentRatingKey),
+            )
+        )
+
+    episodes = list(section.all(libtype="episode"))
+    logger.info("Checking credits status for %d episode(s) in %s...", len(episodes), lib.title, extra={"server_id": server_id})
+
+    with ThreadPoolExecutor(max_workers=_CREDITS_CHECK_WORKERS) as pool:
+        episode_credits = list(pool.map(lambda ep: _safe_has_credits(plex, ep.ratingKey), episodes))
+
+    for ep, has_credits in zip(episodes, episode_credits):
+        rows.append(
+            CachedItem(
+                server_id=server_id,
+                section_id=lib.section_id,
+                rating_key=ep.ratingKey,
+                parent_rating_key=ep.parentRatingKey,
+                show_rating_key=ep.grandparentRatingKey,
+                title=ep.title,
+                type="episode",
+                index=ep.index,
+                season_number=ep.parentIndex,
+                has_thumb=bool(getattr(ep, "thumb", None)),
+                credits_enabled=show_enabled.get(ep.grandparentRatingKey),
+                has_credits=has_credits,
+            )
+        )
+    return rows
+
+
 @celery_app.task(name="app.tasks.sync_library_contents")
 def sync_library_contents(server_id: int) -> None:
     """Snapshots every included library's structure into CachedItem so browsing doesn't have to hit
-    Plex live every time — triggered manually (the "Sync" button on the Servers page), not automatic.
+    Plex live every time — triggered by the "Sync" button on the Servers page, and automatically by
+    check_content_sync once a library's snapshot goes stale.
 
     Uses flat, type-filtered section queries (all shows, all seasons, all episodes, each in one Plex
     API call) rather than walking show -> season -> episode one at a time, which would be an N+1
@@ -443,125 +593,114 @@ def sync_library_contents(server_id: int) -> None:
     credits_enabled (only Movie/Show expose this preference — Episode does not, since Plex's own
     generation setting is per-show, never per-episode, so an episode's value is just copied from
     its parent show rather than checked again) and has_credits (a true per-episode/movie fact,
-    checked directly on every leaf item)."""
+    checked directly on every leaf item).
+
+    Each library is built, swapped in and committed on its own, and a library that fails is logged
+    and skipped rather than aborting the run. Both matter: this used to delete a library's rows
+    first and commit only once at the very end, across every library, so a single unreachable item
+    anywhere rolled the whole thing back to the previous snapshot — leaving a silently stale cache
+    and nothing to indicate anything had gone wrong."""
     db = SessionLocal()
     try:
         server = db.get(ServerConnection, server_id)
         if server is None:
             return
 
-        plex = connect(server.base_url, server.token)
-        libraries = db.query(Library).filter_by(server_id=server_id, included=True).all()
-        if not libraries:
-            logger.warning("Library sync requested for %s but no libraries are included", server.name, extra={"server_id": server_id})
-            return
+        with _content_sync_lock(server_id) as acquired:
+            if not acquired:
+                logger.info(
+                    "Library sync for %s skipped: one is already running",
+                    server.name,
+                    extra={"server_id": server_id},
+                )
+                return
 
-        total = 0
-        for lib in libraries:
-            section = plex.library.sectionByID(lib.section_id)
-            # Clear this library's old snapshot first — simpler and safer than upserting stale rows
-            # for items that were removed/renamed since the last sync.
-            db.query(CachedItem).filter_by(server_id=server_id, section_id=lib.section_id).delete()
+            libraries = db.query(Library).filter_by(server_id=server_id, included=True).all()
+            if not libraries:
+                logger.warning("Library sync requested for %s but no libraries are included", server.name, extra={"server_id": server_id})
+                return
 
-            rows = []
-            if section.type == "movie":
-                movies = list(section.all())
-                logger.info("Checking credits status for %d movie(s) in %s...", len(movies), lib.title, extra={"server_id": server_id})
+            plex = connect(server.base_url, server.token)
 
-                def _check_movie(m) -> CachedItem:
-                    enabled = check_credits_enabled(m)
-                    try:
-                        has_credits = check_has_credits(plex, m.ratingKey)
-                    except Exception:  # noqa: BLE001 — one bad item shouldn't abort the whole sync
-                        has_credits = False
-                    return CachedItem(
-                        server_id=server_id,
-                        section_id=lib.section_id,
-                        rating_key=m.ratingKey,
-                        parent_rating_key=None,
-                        title=m.title,
-                        type="movie",
-                        has_thumb=bool(getattr(m, "thumb", None)),
-                        credits_enabled=enabled,
-                        has_credits=has_credits,
+            total = 0
+            failed = []
+            for lib in libraries:
+                try:
+                    section = plex.library.sectionByID(lib.section_id)
+                    # Build the replacement set before touching what's already cached — this is the
+                    # slow, network-bound part, and nothing is thrown away until there's something
+                    # complete to put in its place.
+                    rows = []
+                    if section.type == "movie":
+                        rows = _build_movie_rows(plex, server_id, lib, section)
+                    elif section.type == "show":
+                        rows = _build_show_rows(plex, server_id, lib, section)
+
+                    db.query(CachedItem).filter_by(server_id=server_id, section_id=lib.section_id).delete()
+                    db.add_all(rows)
+                    # Only advanced once this library has actually been rebuilt, so a failure leaves
+                    # it looking stale to check_content_sync and it gets retried on the next pass.
+                    lib.content_synced_at = datetime.now(timezone.utc)
+                    db.commit()
+                    total += len(rows)
+                except Exception as exc:  # noqa: BLE001 — one library shouldn't sink the others
+                    db.rollback()
+                    failed.append(lib.title)
+                    logger.error(
+                        "Library sync failed for %s: %s",
+                        lib.title,
+                        exc,
+                        extra={"server_id": server_id},
                     )
 
-                with ThreadPoolExecutor(max_workers=_CREDITS_CHECK_WORKERS) as pool:
-                    rows.extend(pool.map(_check_movie, movies))
+            if failed:
+                logger.warning(
+                    "Library sync for %s: %d items cached, %d library/libraries failed and kept their previous snapshot: %s",
+                    server.name,
+                    total,
+                    len(failed),
+                    ", ".join(failed),
+                    extra={"server_id": server_id},
+                )
+            else:
+                logger.info("Library sync complete for %s: %d items cached", server.name, total, extra={"server_id": server_id})
+    finally:
+        db.close()
 
-            elif section.type == "show":
-                shows = list(section.all(libtype="show"))
-                logger.info("Checking credits status for %d show(s) in %s...", len(shows), lib.title, extra={"server_id": server_id})
 
-                # Cheap relative to the episode pass below — one preference read per show, no
-                # per-episode equivalent since Episode doesn't expose the preference at all.
-                with ThreadPoolExecutor(max_workers=_CREDITS_CHECK_WORKERS) as pool:
-                    show_enabled = dict(zip((s.ratingKey for s in shows), pool.map(check_credits_enabled, shows)))
+@celery_app.task(name="app.tasks.check_content_sync")
+def check_content_sync() -> None:
+    """Rebuilds each server's browse cache once it passes settings.content_sync_interval_hours.
 
-                for s in shows:
-                    rows.append(
-                        CachedItem(
-                            server_id=server_id,
-                            section_id=lib.section_id,
-                            rating_key=s.ratingKey,
-                            parent_rating_key=None,
-                            title=s.title,
-                            type="show",
-                            has_thumb=bool(getattr(s, "thumb", None)),
-                            credits_enabled=show_enabled.get(s.ratingKey),
-                        )
-                    )
-                for se in section.all(libtype="season"):
-                    rows.append(
-                        CachedItem(
-                            server_id=server_id,
-                            section_id=lib.section_id,
-                            rating_key=se.ratingKey,
-                            parent_rating_key=se.parentRatingKey,
-                            title=se.title,
-                            type="season",
-                            index=se.index,
-                            season_number=se.index,
-                            has_thumb=bool(getattr(se, "thumb", None)),
-                            credits_enabled=show_enabled.get(se.parentRatingKey),
-                        )
-                    )
+    Without this the cache only ever changed when someone pressed "Sync" on the Servers page, so
+    anything added to Plex afterwards stayed invisible in CreditEngine indefinitely — browse serves
+    from the cache the moment content_synced_at is set, with no staleness signal anywhere in the UI
+    to suggest a rebuild was overdue.
 
-                episodes = list(section.all(libtype="episode"))
-                logger.info("Checking credits status for %d episode(s) in %s...", len(episodes), lib.title, extra={"server_id": server_id})
+    Staleness is read off Library.content_synced_at, which sync_library_contents only advances for
+    libraries it actually rebuilt, so a failed or partial run stays due instead of being recorded as
+    done."""
+    interval_hours = settings.content_sync_interval_hours
+    if interval_hours <= 0:
+        return
 
-                def _episode_has_credits(ep) -> bool:
-                    try:
-                        return check_has_credits(plex, ep.ratingKey)
-                    except Exception:  # noqa: BLE001
-                        return False
-
-                with ThreadPoolExecutor(max_workers=_CREDITS_CHECK_WORKERS) as pool:
-                    episode_credits = list(pool.map(_episode_has_credits, episodes))
-
-                for ep, has_credits in zip(episodes, episode_credits):
-                    rows.append(
-                        CachedItem(
-                            server_id=server_id,
-                            section_id=lib.section_id,
-                            rating_key=ep.ratingKey,
-                            parent_rating_key=ep.parentRatingKey,
-                            show_rating_key=ep.grandparentRatingKey,
-                            title=ep.title,
-                            type="episode",
-                            index=ep.index,
-                            season_number=ep.parentIndex,
-                            has_thumb=bool(getattr(ep, "thumb", None)),
-                            credits_enabled=show_enabled.get(ep.grandparentRatingKey),
-                            has_credits=has_credits,
-                        )
-                    )
-
-            db.add_all(rows)
-            lib.content_synced_at = datetime.now(timezone.utc)
-            total += len(rows)
-
-        db.commit()
-        logger.info("Library sync complete for %s: %d items cached", server.name, total, extra={"server_id": server_id})
+    db = SessionLocal()
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=interval_hours)
+        for server in db.query(ServerConnection):
+            libraries = db.query(Library).filter_by(server_id=server.id, included=True).all()
+            if not any(lib.content_synced_at is None or lib.content_synced_at < cutoff for lib in libraries):
+                continue
+            # The task takes the same lock itself; checking here just avoids queueing work that's
+            # only going to be dropped, and the log line that would come with it.
+            if is_content_sync_running(server.id):
+                continue
+            logger.info(
+                "Content cache for %s is over %dh old — queueing a sync",
+                server.name,
+                interval_hours,
+                extra={"server_id": server.id},
+            )
+            sync_library_contents.delay(server.id)
     finally:
         db.close()

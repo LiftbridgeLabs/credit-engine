@@ -9,7 +9,7 @@ from app.models import ServerConnection, User
 from app.plex_client import connect, get_diagnostics, set_global_credits_behavior
 from app.routers.libraries import sync_libraries_now
 from app.security import get_current_user
-from app.tasks import bootstrap_credits_control, sync_library_contents
+from app.tasks import bootstrap_credits_control, is_content_sync_running, sync_library_contents
 
 router = APIRouter(prefix="/servers", tags=["servers"])
 
@@ -130,8 +130,16 @@ def disable_credits_control(server_id: int, current_user: User = Depends(get_cur
 @router.post("/{server_id}/sync-content")
 def sync_content(server_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Snapshots every included library's structure (titles, ordering, thumb availability) so
-    browsing doesn't have to hit Plex live every time. Manual only for now — runs in the background,
-    can take a while on a large library, same pattern as the credits-control bootstrap."""
+    browsing doesn't have to hit Plex live every time. Runs in the background, can take a while on a
+    large library, same pattern as the credits-control bootstrap.
+
+    This is the "don't wait for the next pass" button, not the only way the cache is ever
+    refreshed — tasks.check_content_sync rebuilds it on an interval too."""
     server = _get_owned_server(server_id, current_user, db)
+    # Only one sync runs per server (tasks._content_sync_lock), so a second request is dropped on
+    # arrival. Reporting "started" for a request that's really going to be discarded is exactly the
+    # kind of silent no-op that makes a stale cache hard to notice.
+    if is_content_sync_running(server.id):
+        return {"status": "already_running"}
     sync_library_contents.delay(server_id)
     return {"status": "sync_started"}

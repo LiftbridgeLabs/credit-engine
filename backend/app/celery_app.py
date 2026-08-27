@@ -31,6 +31,12 @@ celery_app.conf.update(
             "task": "app.tasks.reconcile_new_items",
             "schedule": 120.0,
         },
+        # Checks staleness only — the actual rebuild is skipped unless a library is past
+        # settings.content_sync_interval_hours, so this running often is cheap.
+        "check-content-sync": {
+            "task": "app.tasks.check_content_sync",
+            "schedule": 900.0,
+        },
         "prune-logs": {
             "task": "app.tasks.prune_logs",
             "schedule": 600.0,
