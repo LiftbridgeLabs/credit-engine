@@ -27,6 +27,9 @@ from app import models  # noqa: F401  isort:skip
 
 logger = logging.getLogger(__name__)
 
+# Arbitrary constant naming "the schema migration" for pg_advisory_xact_lock.
+_MIGRATION_LOCK_KEY = 7_311_204_001
+
 
 def _column_default(col):
     """The model's Python-side scalar default, or None if it has none or it's a callable
@@ -72,11 +75,23 @@ def run_migrations(engine: Engine) -> None:
     under supervisor — because ADD COLUMN IF NOT EXISTS makes a lost race a no-op rather than an
     error. Cheap enough to run unconditionally on every start: one catalogue read per table when
     there's nothing to do."""
-    inspector = inspect(engine)
-    existing_tables = set(inspector.get_table_names())
     added: list[tuple[str, str]] = []
+    messages: list[str] = []
 
     with engine.begin() as conn:
+        if engine.dialect.name == "postgresql":
+            # web, worker and beat all run this at once. One at a time is enough, and it stops them
+            # queueing on each other's exclusive table locks. The lock timeout turns "something is
+            # holding a lock we need" into an error with a name, instead of a startup that just goes
+            # quiet — which is exactly how the deadlock below presented, with nothing in any log.
+            conn.execute(text("SET LOCAL lock_timeout = '60s'"))
+            conn.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _MIGRATION_LOCK_KEY})
+
+        # Read the schema only now, holding the lock: a process that lost the race must see what the
+        # winner just committed, not the snapshot from before it started waiting.
+        inspector = inspect(conn)
+        existing_tables = set(inspector.get_table_names())
+
         for table in Base.metadata.sorted_tables:
             if table.name not in existing_tables:
                 continue  # create_all handles brand new tables, with every column already present
@@ -84,18 +99,26 @@ def run_migrations(engine: Engine) -> None:
             for col in table.columns:
                 if col.name in existing_columns:
                     continue
-                logger.info("Migration: adding %s.%s", table.name, col.name)
+                # Not logged here. The database log handler writes through its *own* connection, and
+                # that insert takes a lock on server_connections (log_entries has a foreign key to it)
+                # — which this transaction holds exclusively the moment it alters that table. The
+                # migration waited for the log write and the log write waited for the migration:
+                # a deadlock Postgres cannot see, because one side is waiting on Python, not a lock.
+                messages.append(f"Migration: adding {table.name}.{col.name}")
                 _add_column(conn, table, col, engine.dialect)
                 added.append((table.name, col.name))
 
         if ("app_settings", "content_sync_interval_hours") in added:
-            _seed_content_sync_interval(conn)
+            messages.append(_seed_content_sync_interval(conn))
 
+    # Committed and every lock released — now it's safe to log through the database.
+    for message in messages:
+        logger.info(message)
     if added:
         logger.info("Migration: added %d column(s): %s", len(added), ", ".join(f"{t}.{c}" for t, c in added))
 
 
-def _seed_content_sync_interval(conn) -> None:
+def _seed_content_sync_interval(conn) -> str:
     """Carry CONTENT_SYNC_INTERVAL_HOURS over the one time this column appears.
 
     The interval shipped as an environment variable before it could live in the settings table, and
@@ -106,7 +129,7 @@ def _seed_content_sync_interval(conn) -> None:
         text("UPDATE app_settings SET content_sync_interval_hours = :value"),
         {"value": settings.content_sync_interval_hours},
     )
-    logger.info(
-        "Migration: seeded content_sync_interval_hours from CONTENT_SYNC_INTERVAL_HOURS (%dh)",
-        settings.content_sync_interval_hours,
+    return (
+        "Migration: seeded content_sync_interval_hours from CONTENT_SYNC_INTERVAL_HOURS "
+        f"({settings.content_sync_interval_hours}h)"
     )
