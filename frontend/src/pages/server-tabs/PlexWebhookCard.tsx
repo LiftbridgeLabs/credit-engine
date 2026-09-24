@@ -26,11 +26,16 @@ export function PlexWebhookCard({ server }: { server: ServerConnection }) {
   const [status, setStatus] = useState<PlexWebhookStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // A re-check that finds nothing new changes nothing on screen, which reads as a dead button — so
+  // it shows that it's working, and when it last finished.
+  const [checking, setChecking] = useState(false);
+  const [checkedAt, setCheckedAt] = useState<Date | null>(null);
   const [revealed, setRevealed] = useState(false);
   const urlRef = useRef<HTMLInputElement>(null);
   const toast = useToast();
 
   const load = useCallback(async () => {
+    setChecking(true);
     try {
       setStatus(
         await api.get<PlexWebhookStatus>(
@@ -38,8 +43,11 @@ export function PlexWebhookCard({ server }: { server: ServerConnection }) {
         ),
       );
       setError(null);
+      setCheckedAt(new Date());
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to check the Plex webhook");
+    } finally {
+      setChecking(false);
     }
   }, [server.id, baseUrl]);
 
@@ -179,9 +187,17 @@ export function PlexWebhookCard({ server }: { server: ServerConnection }) {
             {status.registered ? "Registered in Plex" : "Register in Plex"}
           </Button>
         )}
-        <Button variant="secondary" icon={<RefreshCw className="h-3.5 w-3.5" />} onClick={load} disabled={busy}>
-          Re-check
+        <Button
+          variant="secondary"
+          icon={<RefreshCw className={`h-3.5 w-3.5 ${checking ? "animate-spin" : ""}`} />}
+          onClick={load}
+          disabled={busy || checking}
+        >
+          {checking ? "Checking…" : "Re-check"}
         </Button>
+        {checkedAt && !checking && (
+          <span className="self-center text-xs text-slate-500">Checked {checkedAt.toLocaleTimeString()}</span>
+        )}
       </div>
 
       {status && !status.can_manage && (
