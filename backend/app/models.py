@@ -59,6 +59,12 @@ class ServerConnection(Base):
     # scan — bounded on purpose so starting a 20-season show doesn't queue the whole series at once.
     scrobble_lookahead_episodes: Mapped[int] = mapped_column(default=5)
 
+    # Last authenticated call Plex made to this server's watch webhook, and what it was — the only
+    # way to tell "Plex is delivering events" from "Plex has been calling a dead address for weeks",
+    # which looks identical from the outside (nothing happens either way).
+    plex_webhook_last_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    plex_webhook_last_event: Mapped[str | None] = mapped_column(String, nullable=True)
+
     owner: Mapped["User"] = relationship(back_populates="servers")
     libraries: Mapped[list["Library"]] = relationship(back_populates="server", cascade="all, delete-orphan")
 

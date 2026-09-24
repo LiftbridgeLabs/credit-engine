@@ -117,6 +117,23 @@ export interface ServerConnection {
   created_at: string;
   content_sync_running: boolean;
   content_sync_started_at: string | null;
+  plex_webhook_last_event_at: string | null;
+  plex_webhook_last_event: string | null;
+}
+
+export interface PlexWebhookStatus {
+  expected_url: string;
+  last_event_at: string | null;
+  last_event: string | null;
+  // False when this login has no Plex account attached (manual-entry servers) — the URL then has
+  // to be pasted into Plex by hand.
+  can_manage: boolean;
+  // Null when we couldn't look (no account, or plex.tv unreachable) — genuinely unknown, not "no".
+  registered: boolean | null;
+  // Other webhooks in the account that look like CreditEngine's (a stale address, or a second
+  // instance) — secrets redacted, and never anyone else's webhooks.
+  others: { hook_id: string; url: string }[];
+  error: string | null;
 }
 
 export interface Library {

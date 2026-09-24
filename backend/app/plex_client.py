@@ -1,8 +1,10 @@
+import re
 import time
 from datetime import datetime, timedelta
 
 import httpx
 from plexapi.exceptions import NotFound
+from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
 
 from app.config import settings
@@ -121,6 +123,44 @@ def fetch_servers(account_token: str) -> list[dict]:
             }
         )
     return servers
+
+
+_CREDITENGINE_WEBHOOK = re.compile(r"/servers/\d+/webhooks/plex(?:\?|$)")
+
+
+def is_creditengine_webhook(url: str) -> bool:
+    """Whether a webhook registered in a Plex account looks like one of ours (any host, any
+    instance) — used to tell those apart from unrelated ones (Simkl, Trakt...) that we must never
+    touch or even display."""
+    return bool(_CREDITENGINE_WEBHOOK.search(url))
+
+
+def redact_webhook(url: str) -> str:
+    return re.sub(r"(secret=)[^&]+", r"\1•••", url)
+
+
+def account_webhooks(account_token: str) -> list[str]:
+    return MyPlexAccount(token=account_token).webhooks()
+
+
+def update_account_webhooks(account_token: str, add: list[str], remove: list[str]) -> list[str]:
+    """Add and/or remove webhooks in a Plex account, returning the resulting list.
+
+    Plex's API only offers "replace the whole list", and plexapi's addWebhook/deleteWebhook build
+    that list from a copy cached at login — which can be stale or empty, turning "add one" into
+    "erase everything else". So this always re-reads the live list first, applies the change to
+    that, and then verifies every webhook that was meant to survive actually did before returning:
+    this account's other webhooks belong to other services and are not ours to lose."""
+    account = MyPlexAccount(token=account_token)
+    current = account.webhooks()
+    wanted = [u for u in current if u not in remove]
+    wanted += [u for u in add if u not in wanted]
+
+    result = account.setWebhooks(wanted)
+    lost = [u for u in wanted if u not in result]
+    if lost:
+        raise RuntimeError(f"Plex dropped {len(lost)} webhook(s) it was asked to keep — re-check them in Plex settings")
+    return result
 
 
 def apply_credits_rule(plex: PlexServer, section_keys: list[int], criteria: dict) -> dict:
@@ -334,7 +374,7 @@ def browse_all_episodes(plex: PlexServer, rating_key: int):
     return []
 
 
-def find_lookahead_episodes(episode, count: int) -> list:
+def find_lookahead_episodes(plex: PlexServer, episode, count: int) -> list:
     """Up to `count` episodes starting from this one (inclusive), in show order, skipping any
     that already have markers. Bounded on purpose — a 20-season show shouldn't get scanned in
     full just because someone started watching season 1.
@@ -350,7 +390,11 @@ def find_lookahead_episodes(episode, count: int) -> list:
     except StopIteration:
         return []
     candidates = all_episodes[start_idx : start_idx + count]
-    return [e for e in candidates if not e.markers]
+    # Episodes out of show.episodes() are listing entries, and listings never carry markers — so
+    # the check has to ask Plex, or "skip any that already have markers" skips nothing and every
+    # play event re-queues episodes that were finished long ago.
+    has_credits = check_has_credits_bulk(plex, [e.ratingKey for e in candidates])
+    return [e for e in candidates if not has_credits.get(e.ratingKey)]
 
 
 def find_item_by_title_and_guid(plex: PlexServer, section_type: str, title: str, guid_fragment: str):

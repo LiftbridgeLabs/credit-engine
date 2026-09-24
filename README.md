@@ -65,10 +65,16 @@ when someone starts watching.
      Applying it enables matching items and disables everything else in scope — re-running it later
      correctly turns items back off once they stop matching. Give it a `schedule_cron` to re-apply automatically.
    - **Batches**: a fixed list of Plex rating keys, run on demand or on a schedule.
-   - **The Plex webhook** (recommended for real day-to-day use): in Plex, go to Settings → Webhooks →
-     Add Webhook, and paste the URL shown in CreditEngine — find it under a server's settings
-     (`/api/servers/{id}/webhooks/plex?secret=...`). Once added, watching something automatically enables
-     that show and scans the next few unwatched-ahead episodes (5 by default) — not the whole series.
+   - **The Plex webhook** (recommended for real day-to-day use): open a server's **Credits control** tab,
+     find the **Watch webhook** card, and press **Register in Plex** (or copy the URL it shows into
+     Plex → Settings → Webhooks yourself). Once added, *playing* something automatically enables
+     that show and scans the next few episodes that don't have credits yet (5 by default) — not the whole
+     series. Only real playback counts: marking things as watched in Plex sends no webhook, so bulk-marking
+     shows you don't care about won't enable them. The card also shows when Plex last called in, so a
+     webhook pointing at a dead address (after a move, a port change, a rebuild) is visible instead of silent.
+   - **Run credits detection now**: on the same tab, starts Plex's own credits detection immediately for
+     everything you've enabled, rather than waiting for its overnight window. It reads video files, so it
+     can put real load on Plex and your mount — use it when nobody's watching.
 
 ## Sonarr/Radarr (optional)
 

@@ -507,8 +507,10 @@ def handle_plex_scrobble(server_id: int, rating_key: int) -> None:
             server_id=server_id, section_id=item.librarySectionID, included=True
         ).first()
         if library is None:
-            logger.debug(
-                "Scrobble for %s ignored: library %s isn't included",
+            # INFO, not DEBUG: this is the answer to "I watched it and nothing happened", and at
+            # DEBUG it was invisible in the default log view.
+            logger.info(
+                "Watch event for %s ignored: its library (%s) isn't marked Included",
                 describe_item(item),
                 item.librarySectionID,
                 extra={"server_id": server_id},
@@ -517,11 +519,33 @@ def handle_plex_scrobble(server_id: int, rating_key: int) -> None:
 
         if item.type == "episode":
             enable_item_credits(item.show())
-            targets = find_lookahead_episodes(item, server.scrobble_lookahead_episodes)
+            targets = find_lookahead_episodes(plex, item, server.scrobble_lookahead_episodes)
         elif item.type == "movie":
             enable_item_credits(item)
             targets = [item]
         else:
+            return
+
+        # media.play fires for every episode that starts (autoplay included), so the same
+        # neighbours would be re-queued again and again — skip anything already scanned or in
+        # flight recently. Failed jobs don't count, so a transient error gets retried next play.
+        recent = datetime.now(timezone.utc) - timedelta(hours=12)
+        already = {
+            row.rating_key
+            for row in db.query(ScanJob.rating_key).filter(
+                ScanJob.server_id == server_id,
+                ScanJob.rating_key.in_([t.ratingKey for t in targets]),
+                ScanJob.created_at >= recent,
+                ScanJob.status != ScanStatus.failed,
+            )
+        }
+        targets = [t for t in targets if t.ratingKey not in already]
+        if not targets:
+            logger.info(
+                "Watch event: %s — show enabled, nothing new to scan (already have credits or queued recently)",
+                describe_item(item),
+                extra={"server_id": server_id},
+            )
             return
 
         job_ids = []

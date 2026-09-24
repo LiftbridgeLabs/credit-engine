@@ -1,3 +1,5 @@
+import hashlib
+import logging
 import secrets
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -6,7 +8,15 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.models import ServerConnection, User
-from app.plex_client import connect, get_diagnostics, set_global_credits_behavior
+from app.plex_client import (
+    account_webhooks,
+    connect,
+    get_diagnostics,
+    is_creditengine_webhook,
+    redact_webhook,
+    set_global_credits_behavior,
+    update_account_webhooks,
+)
 from app.routers.libraries import sync_libraries_now
 from app.security import get_current_user
 from app.tasks import (
@@ -15,6 +25,8 @@ from app.tasks import (
     request_content_sync_cancel,
     sync_library_contents,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/servers", tags=["servers"])
 
@@ -113,6 +125,120 @@ def get_server_diagnostics(server_id: int, current_user: User = Depends(get_curr
         raise HTTPException(status_code=400, detail=f"Couldn't reach that server: {exc}")
 
 
+class PlexWebhookRequest(BaseModel):
+    # Where Plex should reach *this app* — browsers know it (window.location.origin), the app
+    # can't, since it may sit behind a proxy or be reached by a different name than it sees.
+    callback_base_url: str
+
+
+class PlexWebhookRemoveRequest(BaseModel):
+    hook_id: str
+
+
+def _expected_plex_webhook(server: ServerConnection, callback_base_url: str) -> str:
+    return f"{callback_base_url.rstrip('/')}/api/servers/{server.id}/webhooks/plex?secret={server.webhook_secret}"
+
+
+def _hook_id(url: str) -> str:
+    """Opaque handle for one webhook, so the UI can ask to remove it without the URL (which
+    carries a secret) ever leaving the server."""
+    return hashlib.sha256(url.encode()).hexdigest()[:16]
+
+
+def _account_token(user: User) -> str:
+    if not user.plex_account_token:
+        raise HTTPException(
+            status_code=400,
+            detail="This account isn't signed in with Plex, so there's no Plex account to manage webhooks in. "
+            "Paste the URL into Plex → Settings → Webhooks yourself.",
+        )
+    return user.plex_account_token
+
+
+@router.get("/{server_id}/plex-webhook")
+def plex_webhook_status(
+    server_id: int,
+    callback_base_url: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Whether Plex is set up to tell this app when something is played, and whether it ever has.
+
+    Only ever reports on webhooks that look like this app's (any instance) — an account's other
+    webhooks belong to other services, and their URLs carry those services' tokens."""
+    server = _get_owned_server(server_id, current_user, db)
+    expected = _expected_plex_webhook(server, callback_base_url)
+
+    status = {
+        "expected_url": expected,
+        "last_event_at": server.plex_webhook_last_event_at,
+        "last_event": server.plex_webhook_last_event,
+        "can_manage": bool(current_user.plex_account_token),
+        "registered": None,
+        "others": [],
+        "error": None,
+    }
+    if not current_user.plex_account_token:
+        return status
+
+    try:
+        hooks = account_webhooks(current_user.plex_account_token)
+    except Exception as exc:  # noqa: BLE001
+        status["error"] = f"Couldn't read your Plex account's webhooks: {exc}"
+        return status
+
+    status["registered"] = expected in hooks
+    status["others"] = [
+        {"hook_id": _hook_id(u), "url": redact_webhook(u)}
+        for u in hooks
+        if is_creditengine_webhook(u) and u != expected
+    ]
+    return status
+
+
+@router.post("/{server_id}/plex-webhook/register")
+def register_plex_webhook(
+    server_id: int,
+    body: PlexWebhookRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    server = _get_owned_server(server_id, current_user, db)
+    token = _account_token(current_user)
+    try:
+        update_account_webhooks(token, add=[_expected_plex_webhook(server, body.callback_base_url)], remove=[])
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Couldn't update your Plex account's webhooks: {exc}")
+    logger.info("Registered Plex watch webhook for %s", server.name, extra={"server_id": server_id})
+    return {"status": "registered"}
+
+
+@router.post("/{server_id}/plex-webhook/remove")
+def remove_plex_webhook(
+    server_id: int,
+    body: PlexWebhookRemoveRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Removes one of this app's *other* webhooks (a stale address, say). Deliberately one at a
+    time and by explicit choice: a CreditEngine-shaped URL might be a second, perfectly healthy
+    instance, which this app has no way to tell apart from a dead one."""
+    _get_owned_server(server_id, current_user, db)
+    token = _account_token(current_user)
+    try:
+        current = account_webhooks(token)
+        matches = [u for u in current if is_creditengine_webhook(u) and _hook_id(u) == body.hook_id]
+        if not matches:
+            raise HTTPException(status_code=404, detail="That webhook is already gone")
+        update_account_webhooks(token, add=[], remove=matches)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Couldn't update your Plex account's webhooks: {exc}")
+    logger.info("Removed a Plex webhook: %s", redact_webhook(matches[0]), extra={"server_id": server_id})
+    return {"status": "removed"}
+
+
 @router.post("/{server_id}/credits-control/enable")
 def enable_credits_control(server_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Kicks off the one-time bootstrap: disables credits-marker generation on every existing item
@@ -124,6 +250,28 @@ def enable_credits_control(server_id: int, current_user: User = Depends(get_curr
 
     bootstrap_credits_control.delay(server_id)
     return {"status": "bootstrap_started"}
+
+
+@router.post("/{server_id}/credits-control/run-detection")
+def run_credits_detection_now(server_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Starts Plex's own credits-detection task right now instead of waiting for its maintenance
+    window. What it processes is still decided by the per-show flags — so this is "generate for
+    everything I've enabled, now", not "scan the library". Refused unless credits control has been
+    set up: without that, nothing is opted out and this would mean every item on the server."""
+    server = _get_owned_server(server_id, current_user, db)
+    if not server.credits_control_enabled:
+        raise HTTPException(
+            status_code=400,
+            detail="Credits control isn't enabled for this server, so nothing is opted out yet — running "
+            "detection now would process every item, not just the ones you've chosen.",
+        )
+    try:
+        plex = connect(server.base_url, server.token)
+        plex.runButlerTask("ButlerTaskGenerateCreditsMarkers")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Couldn't start credits detection: {exc}")
+    logger.info("Started Plex credits detection on demand for %s", server.name, extra={"server_id": server_id})
+    return {"status": "started"}
 
 
 @router.post("/{server_id}/credits-control/disable")

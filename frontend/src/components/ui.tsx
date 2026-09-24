@@ -1,4 +1,4 @@
-import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode } from "react";
+import type { ButtonHTMLAttributes, ComponentPropsWithRef, ReactNode } from "react";
 import { Loader2 } from "lucide-react";
 
 export function Button({
@@ -34,7 +34,7 @@ export function Button({
   );
 }
 
-export function Input(props: InputHTMLAttributes<HTMLInputElement>) {
+export function Input(props: ComponentPropsWithRef<"input">) {
   return (
     <input
       {...props}

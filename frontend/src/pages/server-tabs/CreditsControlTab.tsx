@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { Sparkles, Clock, Info } from "lucide-react";
+import { Sparkles, Clock, Info, Play } from "lucide-react";
 import { api, ApiError, type ServerConnection } from "../../lib/api";
 import { Badge, Button, Card, ErrorBanner, Spinner } from "../../components/ui";
 import { useToast } from "../../components/toast";
 import { DiagnosticsPanel } from "./DiagnosticsPanel";
+import { PlexWebhookCard } from "./PlexWebhookCard";
 
 export default function CreditsControlTab({
   server,
@@ -53,6 +54,27 @@ export default function CreditsControlTab({
       startPolling();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to start bootstrap");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runDetectionNow() {
+    if (
+      !confirm(
+        "Start Plex's credits detection right now for every show and movie you've enabled?\n\n" +
+          "It reads the actual video files, so on a debrid-backed library it can put real load on Plex and " +
+          "your mount while people are watching. Normally this waits for Plex's overnight window.",
+      )
+    )
+      return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.post(`/servers/${server.id}/credits-control/run-detection`);
+      toast("Credits detection started in Plex — it runs in the background, watch Plex's activity list");
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to start credits detection");
     } finally {
       setBusy(false);
     }
@@ -136,12 +158,19 @@ export default function CreditsControlTab({
               Enable credits control
             </Button>
           ) : (
-            <Button variant="danger" onClick={disable} disabled={busy} icon={busy ? <Spinner /> : undefined}>
-              Disable credits control
-            </Button>
+            <div className="flex flex-wrap gap-2">
+              <Button onClick={runDetectionNow} disabled={busy} icon={busy ? <Spinner /> : <Play className="h-3.5 w-3.5" />}>
+                Run credits detection now
+              </Button>
+              <Button variant="danger" onClick={disable} disabled={busy}>
+                Disable credits control
+              </Button>
+            </div>
           )}
         </div>
       </Card>
+
+      <PlexWebhookCard server={server} />
 
       <DiagnosticsPanel server={server} />
     </div>
