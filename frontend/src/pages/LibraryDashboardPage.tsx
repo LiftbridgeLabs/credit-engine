@@ -11,8 +11,9 @@ import {
   CheckCircle2,
   Filter,
   Ban,
+  RefreshCw,
 } from "lucide-react";
-import { api, ApiError, type BrowseItem, type Library, type LibraryStats } from "../lib/api";
+import { api, ApiError, type BrowseItem, type ItemRefresh, type Library, type LibraryStats } from "../lib/api";
 import { Badge, Button, Card, ErrorBanner, Input, Spinner, Toggle } from "../components/ui";
 import { Thumb } from "../components/Thumb";
 import { PAGE_SIZES, getStoredPageSize, setStoredPageSize } from "../lib/pageSize";
@@ -22,6 +23,15 @@ import { LIBRARY_SORTS, getStoredSort, setStoredSort, sortItems, type LibrarySor
 // navigating away and back reads from here first instead of re-fetching from scratch every time.
 const itemsCache = new Map<string, BrowseItem[]>();
 const statsCache = new Map<string, LibraryStats>();
+
+function refreshPatch({ rating_key: _key, title: _title, ...patch }: ItemRefresh): Partial<BrowseItem> {
+  return patch;
+}
+
+/** Re-checks one show or movie against Plex — the cached counts otherwise only move on a full sync. */
+function refreshItem(serverId: number, ratingKey: number): Promise<ItemRefresh> {
+  return api.post<ItemRefresh>(`/servers/${serverId}/browse/${ratingKey}/refresh`);
+}
 
 function StatCard({ value, label }: { value: number; label: string }) {
   return (
@@ -169,6 +179,18 @@ function PosterCard({
   const [scanStatus, setScanStatus] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
   const [toggling, setToggling] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+
+  async function refresh() {
+    setRefreshing(true);
+    try {
+      onToggled(item.rating_key, refreshPatch(await refreshItem(serverId, item.rating_key)));
+    } catch {
+      // the tile keeps its last known numbers
+    } finally {
+      setRefreshing(false);
+    }
+  }
 
   async function scan(e: React.MouseEvent) {
     e.stopPropagation();
@@ -273,11 +295,22 @@ function PosterCard({
         </span>
         {(item.type === "show" || item.type === "movie") && (
           <button
+            onClick={refresh}
+            disabled={refreshing}
+            title="Re-check credits with Plex now"
+            aria-label={`Re-check credits for ${item.title}`}
+            className="ml-auto rounded p-1 text-slate-400 hover:text-brand-600 dark:hover:text-brand-400"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${refreshing ? "animate-spin" : ""}`} />
+          </button>
+        )}
+        {(item.type === "show" || item.type === "movie") && (
+          <button
             onClick={toggleNever}
             disabled={toggling}
             title={item.never ? "Allow credits again (doesn't switch it on)" : "Never generate credits, whoever watches it"}
             aria-label={item.never ? `Allow credits for ${item.title} again` : `Never generate credits for ${item.title}`}
-            className={`ml-auto rounded p-1 ${
+            className={`rounded p-1 ${
               item.never
                 ? "text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-950/50"
                 : "text-slate-400 hover:text-red-600 dark:hover:text-red-400"
@@ -370,6 +403,12 @@ export default function LibraryDashboardPage() {
     if (!item.has_children) return;
     setDrilled(item);
     setDrilledChildren(null);
+    // Re-checked first, so the episode list shows what Plex has now rather than the last sync.
+    try {
+      handleToggled(item.rating_key, refreshPatch(await refreshItem(serverId, item.rating_key)));
+    } catch {
+      // fall back to the cached list
+    }
     try {
       setDrilledChildren(await api.get<BrowseItem[]>(`/servers/${serverId}/browse/${item.rating_key}/children`));
     } catch (err) {

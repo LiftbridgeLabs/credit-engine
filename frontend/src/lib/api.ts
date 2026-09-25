@@ -205,6 +205,16 @@ export interface BrowseItem {
   never?: boolean;
 }
 
+// What a live re-check of one show or movie against Plex returns — a patch for its tile.
+export interface ItemRefresh {
+  rating_key: number;
+  title: string;
+  credits_enabled: boolean | null;
+  has_credits?: boolean;
+  episode_count?: number;
+  episodes_with_credits?: number;
+}
+
 export interface LibraryStats {
   top_level_count: number;
   total_items: number;

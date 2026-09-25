@@ -4,7 +4,7 @@ from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.item_cache import excluded_rating_keys, set_cached_credits_enabled
+from app.item_cache import excluded_rating_keys, refresh_item_credits, set_cached_credits_enabled
 from app.models import CachedItem, CreditsExclusion, Library, ServerConnection, User
 from app.plex_client import browse_all_episodes, browse_children, browse_top_level, connect, disable_item_credits, enable_item_credits
 from app.security import get_current_user, get_current_user_via_query
@@ -198,6 +198,27 @@ def set_item_credits(
     db.commit()
 
     return {"rating_key": rating_key, "credits_enabled": enabled}
+
+
+@router.post("/{rating_key}/refresh")
+def refresh_item(
+    server_id: int,
+    rating_key: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Re-checks one show or movie against Plex now, rather than waiting for the next library sync —
+    what the page calls when a show is opened, and the tile's refresh button."""
+    server = _get_owned_server(server_id, current_user, db)
+    try:
+        plex = connect(server.base_url, server.token)
+        result = refresh_item_credits(db, plex, server_id, rating_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Couldn't re-check that item: {exc}")
+    db.commit()
+    return result
 
 
 @router.post("/{rating_key}/never")

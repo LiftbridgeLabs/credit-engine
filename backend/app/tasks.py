@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.celery_app import celery_app
 from app.config import settings
 from app.db import SessionLocal
-from app.item_cache import excluded_rating_keys, set_cached_credits_enabled
+from app.item_cache import excluded_rating_keys, refresh_item_credits, set_cached_credits_enabled
 from app.models import (
     AppSettings,
     CachedItem,
@@ -90,6 +90,26 @@ def _content_sync_lock_key(server_id: int) -> str:
 
 def _content_sync_cancel_key(server_id: int) -> str:
     return f"creditengine:content-sync-cancel:{server_id}"
+
+
+# Plex does the detection itself, in the background, some time after it's asked — so the browse
+# cache is re-checked this long after a play, a scan or a detection run, not straight away.
+_CREDITS_RECHECK_DELAY = 1800
+
+
+def schedule_credits_recheck(server_id: int, rating_key: int) -> None:
+    """Queue one delayed re-check of a show or movie. "Scan all episodes" on a 40-episode season
+    would otherwise queue forty identical ones, so repeats inside the delay are dropped."""
+    try:
+        client = redis.Redis.from_url(settings.redis_url)
+        try:
+            if not client.set(f"creditengine:credits-recheck:{server_id}:{rating_key}", "1", nx=True, ex=_CREDITS_RECHECK_DELAY):
+                return
+        finally:
+            client.close()
+    except Exception:  # noqa: BLE001 — without Redis, a duplicate re-check is harmless
+        pass
+    recheck_cached_credits.apply_async((server_id, rating_key), countdown=_CREDITS_RECHECK_DELAY)
 
 
 def request_content_sync_cancel(server_id: int) -> str:
@@ -286,6 +306,7 @@ def run_scan_job(scan_job_id: int) -> None:
                 raise ValueError(f"{item.type} isn't a movie or episode — refusing to avoid a full-show scan")
             analyze_item(item)
             job.status = ScanStatus.complete
+            schedule_credits_recheck(job.server_id, item.grandparentRatingKey if item.type == "episode" else item.ratingKey)
             logger.info(
                 "Scan complete: %s (rating key %s)",
                 job.title,
@@ -544,6 +565,7 @@ def handle_plex_scrobble(server_id: int, rating_key: int) -> None:
         if enable_item_credits(owner):
             set_cached_credits_enabled(db, server_id, owner.ratingKey, True)
             db.commit()
+            schedule_credits_recheck(server_id, owner.ratingKey)
 
         # media.play fires for every episode that starts (autoplay included), so the same
         # neighbours would be re-queued again and again — skip anything already scanned or in
@@ -584,6 +606,32 @@ def handle_plex_scrobble(server_id: int, rating_key: int) -> None:
         )
         for job_id in job_ids:
             run_scan_job.delay(job_id)
+    finally:
+        db.close()
+
+
+@celery_app.task(name="app.tasks.recheck_cached_credits")
+def recheck_cached_credits(server_id: int, rating_key: int) -> None:
+    db = SessionLocal()
+    try:
+        server = db.get(ServerConnection, server_id)
+        if server is None:
+            return
+        try:
+            result = refresh_item_credits(db, connect(server.base_url, server.token), server_id, rating_key)
+        except Exception as exc:  # noqa: BLE001 — the next sync or a page visit catches it up anyway
+            db.rollback()
+            logger.warning("Credits re-check for rating key %s failed: %s", rating_key, exc, extra={"server_id": server_id})
+            return
+        db.commit()
+        if "episode_count" in result:
+            logger.info(
+                "Credits re-check: %s — %d of %d episodes have credits",
+                result["title"],
+                result["episodes_with_credits"],
+                result["episode_count"],
+                extra={"server_id": server_id},
+            )
     finally:
         db.close()
 

@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.models import ServerConnection, User
+from app.models import CachedItem, ServerConnection, User
 from app.plex_client import (
     account_webhooks,
     connect,
@@ -23,6 +23,7 @@ from app.tasks import (
     bootstrap_credits_control,
     content_sync_started_at,
     request_content_sync_cancel,
+    schedule_credits_recheck,
     sync_library_contents,
 )
 
@@ -271,6 +272,13 @@ def run_credits_detection_now(server_id: int, current_user: User = Depends(get_c
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"Couldn't start credits detection: {exc}")
     logger.info("Started Plex credits detection on demand for %s", server.name, extra={"server_id": server_id})
+    enabled = db.query(CachedItem.rating_key).filter(
+        CachedItem.server_id == server_id,
+        CachedItem.type.in_(["show", "movie"]),
+        CachedItem.credits_enabled.is_(True),
+    )
+    for row in enabled:
+        schedule_credits_recheck(server_id, row.rating_key)
     return {"status": "started"}
 
 
