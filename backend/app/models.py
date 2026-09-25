@@ -224,3 +224,18 @@ class AppSettings(Base):
     # them. Not a schedule — the beat entry decides how often staleness is *checked*, this decides
     # what counts as stale. 0 disables the automatic rebuild, leaving only the Sync content button.
     content_sync_interval_hours: Mapped[int] = mapped_column(Integer, default=24)
+
+
+class CreditsExclusion(Base):
+    """A show or movie the user never wants credits for, whoever watches it — e.g. a long-running
+    show where a single play would otherwise have Plex work through hundreds of episodes. Its own
+    table rather than a CachedItem column because the cache is rebuilt wholesale on every sync."""
+
+    __tablename__ = "credits_exclusions"
+    __table_args__ = (UniqueConstraint("server_id", "rating_key"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    server_id: Mapped[int] = mapped_column(ForeignKey("server_connections.id", ondelete="CASCADE"), index=True)
+    rating_key: Mapped[int] = mapped_column()
+    title: Mapped[str] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

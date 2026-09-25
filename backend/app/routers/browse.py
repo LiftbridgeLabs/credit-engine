@@ -4,8 +4,8 @@ from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.item_cache import set_cached_credits_enabled
-from app.models import CachedItem, Library, ServerConnection, User
+from app.item_cache import excluded_rating_keys, set_cached_credits_enabled
+from app.models import CachedItem, CreditsExclusion, Library, ServerConnection, User
 from app.plex_client import browse_all_episodes, browse_children, browse_top_level, connect, disable_item_credits, enable_item_credits
 from app.security import get_current_user, get_current_user_via_query
 
@@ -56,7 +56,7 @@ def _episode_rollups(db: Session, server_id: int, section_id: int) -> dict[int, 
     return {r.show_rating_key: (r.total, int(r.with_credits or 0)) for r in rows}
 
 
-def _serialize_cached(c: CachedItem, rollups: dict[int, tuple[int, int]] | None = None) -> dict:
+def _serialize_cached(c: CachedItem, rollups: dict[int, tuple[int, int]] | None = None, excluded: set[int] = frozenset()) -> dict:
     episode_count = episodes_with_credits = None
     if c.type == "show" and rollups is not None:
         episode_count, episodes_with_credits = rollups.get(c.rating_key, (0, 0))
@@ -72,6 +72,7 @@ def _serialize_cached(c: CachedItem, rollups: dict[int, tuple[int, int]] | None 
         "has_credits": c.has_credits,
         "episode_count": episode_count,
         "episodes_with_credits": episodes_with_credits,
+        "never": c.rating_key in excluded,
     }
 
 
@@ -100,7 +101,8 @@ def browse_section(
             .all()
         )
         rollups = _episode_rollups(db, server_id, section_id)
-        serialized = [_serialize_cached(c, rollups) for c in cached]
+        excluded = excluded_rating_keys(db, server_id)
+        serialized = [_serialize_cached(c, rollups, excluded) for c in cached]
         if missing_only:
             serialized = [
                 s
@@ -190,9 +192,49 @@ def set_item_credits(
 
     # Keep the cache in sync immediately rather than waiting for the next full Sync.
     set_cached_credits_enabled(db, server_id, rating_key, enabled)
+    if enabled:
+        # Switching it on by hand is a clearer instruction than an earlier Never.
+        db.query(CreditsExclusion).filter_by(server_id=server_id, rating_key=rating_key).delete()
     db.commit()
 
     return {"rating_key": rating_key, "credits_enabled": enabled}
+
+
+@router.post("/{rating_key}/never")
+def set_item_never(
+    server_id: int,
+    rating_key: int,
+    never: bool,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Never: this show or movie stays off no matter who watches it or what a rule matches. Setting
+    it also switches it off in Plex now, since an already-enabled show would otherwise keep going
+    through Plex's overnight detection. Clearing it only lifts the block — it doesn't switch
+    anything back on; the next play (or the toggle) does that."""
+    server = _get_owned_server(server_id, current_user, db)
+    existing = db.query(CreditsExclusion).filter_by(server_id=server_id, rating_key=rating_key).first()
+
+    if not never:
+        if existing is not None:
+            db.delete(existing)
+            db.commit()
+        return {"rating_key": rating_key, "never": False}
+
+    try:
+        plex = connect(server.base_url, server.token)
+        item = plex.fetchItem(rating_key)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Couldn't reach that item: {exc}")
+    if item.type not in ("show", "movie"):
+        raise HTTPException(status_code=400, detail=f"Never applies to a whole show or movie, not a {item.type}")
+
+    disable_item_credits(item)
+    set_cached_credits_enabled(db, server_id, rating_key, False)
+    if existing is None:
+        db.add(CreditsExclusion(server_id=server_id, rating_key=rating_key, title=item.title))
+    db.commit()
+    return {"rating_key": rating_key, "never": True, "credits_enabled": False}
 
 
 @router.get("/{rating_key}/children")

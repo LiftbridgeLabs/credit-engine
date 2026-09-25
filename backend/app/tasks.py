@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.celery_app import celery_app
 from app.config import settings
 from app.db import SessionLocal
-from app.item_cache import set_cached_credits_enabled
+from app.item_cache import excluded_rating_keys, set_cached_credits_enabled
 from app.models import (
     AppSettings,
     CachedItem,
@@ -330,7 +330,7 @@ def apply_rule_job(rule_id: int) -> None:
             return
 
         plex = connect(server.base_url, server.token)
-        result = apply_credits_rule(plex, section_keys, rule.criteria)
+        result = apply_credits_rule(plex, section_keys, rule.criteria, excluded_rating_keys(db, rule.server_id))
         for key in result["enabled_keys"]:
             set_cached_credits_enabled(db, rule.server_id, key, True)
         for key in result["disabled_keys"]:
@@ -532,6 +532,14 @@ def handle_plex_scrobble(server_id: int, rating_key: int) -> None:
             owner = item
             targets = [item]
         else:
+            return
+        if owner.ratingKey in excluded_rating_keys(db, server_id):
+            logger.info(
+                "Watch event for %s ignored: %s is set to Never",
+                describe_item(item),
+                owner.title,
+                extra={"server_id": server_id},
+            )
             return
         if enable_item_credits(owner):
             set_cached_credits_enabled(db, server_id, owner.ratingKey, True)

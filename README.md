@@ -72,6 +72,11 @@ when someone starts watching.
      series. Only real playback counts: marking things as watched in Plex sends no webhook, so bulk-marking
      shows you don't care about won't enable them. The card also shows when Plex last called in, so a
      webhook pointing at a dead address (after a move, a port change, a rebuild) is visible instead of silent.
+   - **Never**: the ⊘ button on a show or movie in the library switches it off and keeps it off,
+     whoever watches it and whatever a rule matches — for long-running shows where one play would have
+     Plex work through hundreds of episodes. Plex's setting is per show, not per season, so an enabled
+     show gets *all* its missing episodes detected overnight, not just the next few. Switching the show
+     on by hand lifts Never.
    - **Run credits detection now**: on the same tab, starts Plex's own credits detection immediately for
      everything you've enabled, rather than waiting for its overnight window. It reads video files, so it
      can put real load on Plex and your mount — use it when nobody's watching.

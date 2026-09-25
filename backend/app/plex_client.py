@@ -163,7 +163,7 @@ def update_account_webhooks(account_token: str, add: list[str], remove: list[str
     return result
 
 
-def apply_credits_rule(plex: PlexServer, section_keys: list[int], criteria: dict) -> dict:
+def apply_credits_rule(plex: PlexServer, section_keys: list[int], criteria: dict, excluded: set[int] = frozenset()) -> dict:
     """Full enable/disable pass over the rule's target sections: matches get their credits-marker
     override reverted to inherit (enabled), everything else gets forced off. Re-running a rule after
     an item stops matching (e.g. no longer "recently watched") correctly turns it back off."""
@@ -179,7 +179,8 @@ def apply_credits_rule(plex: PlexServer, section_keys: list[int], criteria: dict
     for key in section_keys:
         section = plex.library.sectionByID(key)
         for item in section.all():
-            if item.lastViewedAt is not None and item.lastViewedAt >= cutoff:
+            # Never-listed items are treated as non-matching, so a rule turns them off, never on.
+            if item.ratingKey not in excluded and item.lastViewedAt is not None and item.lastViewedAt >= cutoff:
                 if enable_item_credits(item):
                     enabled_titles.append(item.title)
                     enabled_keys.append(item.ratingKey)

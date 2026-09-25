@@ -1,6 +1,6 @@
 from sqlalchemy.orm import Session
 
-from app.models import CachedItem
+from app.models import CachedItem, CreditsExclusion
 
 
 def set_cached_credits_enabled(db: Session, server_id: int, rating_key: int, enabled: bool) -> None:
@@ -13,3 +13,8 @@ def set_cached_credits_enabled(db: Session, server_id: int, rating_key: int, ena
     db.query(CachedItem).filter_by(server_id=server_id, parent_rating_key=rating_key, type="season").update(
         {"credits_enabled": enabled}
     )
+
+
+def excluded_rating_keys(db: Session, server_id: int) -> set[int]:
+    """Shows/movies marked Never on this server — nothing may turn their credits back on."""
+    return {row.rating_key for row in db.query(CreditsExclusion.rating_key).filter_by(server_id=server_id)}

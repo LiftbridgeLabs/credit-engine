@@ -10,11 +10,13 @@ import {
   Search,
   CheckCircle2,
   Filter,
+  Ban,
 } from "lucide-react";
 import { api, ApiError, type BrowseItem, type Library, type LibraryStats } from "../lib/api";
 import { Badge, Button, Card, ErrorBanner, Input, Spinner, Toggle } from "../components/ui";
 import { Thumb } from "../components/Thumb";
 import { PAGE_SIZES, getStoredPageSize, setStoredPageSize } from "../lib/pageSize";
+import { LIBRARY_SORTS, getStoredSort, setStoredSort, sortItems, type LibrarySort } from "../lib/librarySort";
 
 // Survives component unmount (plain module state, not React state) — switching libraries or
 // navigating away and back reads from here first instead of re-fetching from scratch every time.
@@ -162,7 +164,7 @@ function PosterCard({
   serverId: number;
   item: BrowseItem;
   onOpen: () => void;
-  onToggled: (ratingKey: number, enabled: boolean) => void;
+  onToggled: (ratingKey: number, patch: Partial<BrowseItem>) => void;
 }) {
   const [scanStatus, setScanStatus] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
@@ -187,7 +189,8 @@ function PosterCard({
     try {
       const next = !item.credits_enabled;
       await api.post(`/servers/${serverId}/browse/${item.rating_key}/credits?enabled=${next}`);
-      onToggled(item.rating_key, next);
+      // Switching it on by hand also lifts Never (the server does the same).
+      onToggled(item.rating_key, next ? { credits_enabled: true, never: false } : { credits_enabled: false });
     } catch {
       // silently leave the toggle as-is — the card will just still show the old state, which is
       // accurate, so no separate error surface needed for this one
@@ -195,6 +198,29 @@ function PosterCard({
       setToggling(false);
     }
   }
+
+  async function toggleNever() {
+    const next = !item.never;
+    if (
+      next &&
+      !confirm(
+        `Never generate credits for ${item.title}?\n\nIt's switched off now and stays off, whoever watches it ` +
+          "and whatever a rule matches. Switch it on here any time to undo.",
+      )
+    )
+      return;
+    setToggling(true);
+    try {
+      await api.post(`/servers/${serverId}/browse/${item.rating_key}/never?never=${next}`);
+      onToggled(item.rating_key, next ? { never: true, credits_enabled: false } : { never: false });
+    } catch {
+      // as with the toggle: the card keeps showing the state that's still true
+    } finally {
+      setToggling(false);
+    }
+  }
+
+  const stateLabel = toggling ? "Saving…" : item.never ? "Never" : item.credits_enabled ? "Enabled" : "Disabled";
 
   return (
     <div>
@@ -242,7 +268,24 @@ function PosterCard({
       )}
       <div className="flex items-center gap-1.5 mt-1" onClick={(e) => e.stopPropagation()}>
         <Toggle checked={!!item.credits_enabled} onChange={toggleCredits} label={`Enable credits for ${item.title}`} />
-        <span className="text-xs text-slate-500">{toggling ? "Saving…" : item.credits_enabled ? "Enabled" : "Disabled"}</span>
+        <span className={`text-xs ${item.never && !toggling ? "text-red-600 dark:text-red-400 font-medium" : "text-slate-500"}`}>
+          {stateLabel}
+        </span>
+        {(item.type === "show" || item.type === "movie") && (
+          <button
+            onClick={toggleNever}
+            disabled={toggling}
+            title={item.never ? "Allow credits again (doesn't switch it on)" : "Never generate credits, whoever watches it"}
+            aria-label={item.never ? `Allow credits for ${item.title} again` : `Never generate credits for ${item.title}`}
+            className={`ml-auto rounded p-1 ${
+              item.never
+                ? "text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-950/50"
+                : "text-slate-400 hover:text-red-600 dark:hover:text-red-400"
+            }`}
+          >
+            <Ban className="h-3.5 w-3.5" />
+          </button>
+        )}
       </div>
     </div>
   );
@@ -263,6 +306,7 @@ export default function LibraryDashboardPage() {
   const [missingOnly, setMissingOnly] = useState(false);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(getStoredPageSize);
+  const [sort, setSort] = useState<LibrarySort>(getStoredSort);
   const [drilled, setDrilled] = useState<BrowseItem | null>(null);
   const [drilledChildren, setDrilledChildren] = useState<BrowseItem[] | null>(null);
 
@@ -301,17 +345,22 @@ export default function LibraryDashboardPage() {
 
   useEffect(() => {
     setPage(1);
-  }, [filter, pageSize, missingOnly]);
+  }, [filter, pageSize, missingOnly, sort]);
 
   function changePageSize(size: number) {
     setPageSize(size);
     setStoredPageSize(size);
   }
 
-  function handleToggled(ratingKey: number, enabled: boolean) {
+  function changeSort(next: LibrarySort) {
+    setSort(next);
+    setStoredSort(next);
+  }
+
+  function handleToggled(ratingKey: number, patch: Partial<BrowseItem>) {
     setItems((prev) => {
       if (!prev) return prev;
-      const next = prev.map((i) => (i.rating_key === ratingKey ? { ...i, credits_enabled: enabled } : i));
+      const next = prev.map((i) => (i.rating_key === ratingKey ? { ...i, ...patch } : i));
       itemsCache.set(cacheKey, next);
       return next;
     });
@@ -329,7 +378,7 @@ export default function LibraryDashboardPage() {
   }
 
   const currentLib = libraries.find((l) => l.section_id === sectionId);
-  const filtered = (items ?? []).filter((i) => {
+  const filtered = sortItems(items ?? [], sort).filter((i) => {
     if (!i.title.toLowerCase().includes(filter.toLowerCase())) return false;
     if (missingOnly) {
       if (i.type === "movie") return !i.has_credits;
@@ -435,6 +484,18 @@ export default function LibraryDashboardPage() {
             >
               Missing only
             </Button>
+            <select
+              value={sort}
+              onChange={(e) => changeSort(e.target.value as LibrarySort)}
+              aria-label="Sort"
+              className="px-2 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm shrink-0"
+            >
+              {Object.entries(LIBRARY_SORTS).map(([value, label]) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
+            </select>
             <select
               value={pageSize}
               onChange={(e) => changePageSize(Number(e.target.value))}

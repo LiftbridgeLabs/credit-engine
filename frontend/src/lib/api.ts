@@ -201,6 +201,8 @@ export interface BrowseItem {
   // Only populated on "show" rows, from a per-library rollup computed at browse time.
   episode_count: number | null;
   episodes_with_credits: number | null;
+  // Show/movie rows only: marked Never, so no play or rule may switch its credits on.
+  never?: boolean;
 }
 
 export interface LibraryStats {
