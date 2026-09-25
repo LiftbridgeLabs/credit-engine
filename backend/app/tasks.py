@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.celery_app import celery_app
 from app.config import settings
 from app.db import SessionLocal
+from app.item_cache import set_cached_credits_enabled
 from app.models import (
     AppSettings,
     CachedItem,
@@ -330,6 +331,10 @@ def apply_rule_job(rule_id: int) -> None:
 
         plex = connect(server.base_url, server.token)
         result = apply_credits_rule(plex, section_keys, rule.criteria)
+        for key in result["enabled_keys"]:
+            set_cached_credits_enabled(db, rule.server_id, key, True)
+        for key in result["disabled_keys"]:
+            set_cached_credits_enabled(db, rule.server_id, key, False)
 
         rule.last_run_at = datetime.now(timezone.utc)
         db.commit()
@@ -385,6 +390,9 @@ def bootstrap_credits_control(server_id: int) -> None:
 
         set_global_credits_behavior(plex, "scheduled")
 
+        # Everything was just forced off in Plex; the browse cache has to say so too, or shows that
+        # were on before the reset keep displaying "Enabled".
+        db.query(CachedItem).filter_by(server_id=server_id).update({"credits_enabled": False})
         server.credits_control_enabled = True
         server.credits_control_bootstrapped_at = datetime.now(timezone.utc)
         # Anything added during this (possibly long) run wasn't in the section.all() snapshot above —
@@ -518,13 +526,16 @@ def handle_plex_scrobble(server_id: int, rating_key: int) -> None:
             return
 
         if item.type == "episode":
-            enable_item_credits(item.show())
+            owner = item.show()
             targets = find_lookahead_episodes(plex, item, server.scrobble_lookahead_episodes)
         elif item.type == "movie":
-            enable_item_credits(item)
+            owner = item
             targets = [item]
         else:
             return
+        if enable_item_credits(owner):
+            set_cached_credits_enabled(db, server_id, owner.ratingKey, True)
+            db.commit()
 
         # media.play fires for every episode that starts (autoplay included), so the same
         # neighbours would be re-queued again and again — skip anything already scanned or in

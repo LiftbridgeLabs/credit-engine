@@ -53,6 +53,15 @@ def receive_plex_webhook(server_id: int, secret: str, payload: str = Form(...), 
     event = data.get("event", "unknown")
     metadata = data.get("Metadata", {})
     label = metadata.get("grandparentTitle") or metadata.get("title") or "?"
+    # Plex webhooks belong to the account, not a server: this one URL hears plays on *every* server
+    # the account owns, and rating keys are per-server — so a play elsewhere, looked up here, is the
+    # wrong item or none at all. Plex's server id is only known for servers linked from the account.
+    plex_server = data.get("Server") or {}
+    from_elsewhere = bool(
+        server.client_identifier and plex_server.get("uuid") and plex_server["uuid"] != server.client_identifier
+    )
+    if from_elsewhere:
+        label = f"{label} (on {plex_server.get('title') or 'another server'} — ignored)"
 
     # Recorded before anything can decide to ignore the event: this is the delivery receipt. Without
     # it, "Plex isn't calling us" and "Plex calls us and we quietly skip it" are indistinguishable.
@@ -61,6 +70,8 @@ def receive_plex_webhook(server_id: int, secret: str, payload: str = Form(...), 
     db.commit()
     logger.info("Plex webhook %s — %s", event, label, extra={"server_id": server_id})
 
+    if from_elsewhere:
+        return {"status": "ignored", "reason": "played on a different Plex server"}
     if not server.credits_control_enabled:
         return {"status": "ignored", "reason": "credits control not enabled for this server"}
 

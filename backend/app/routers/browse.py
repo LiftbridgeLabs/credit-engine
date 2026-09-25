@@ -4,6 +4,7 @@ from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from app.db import get_db
+from app.item_cache import set_cached_credits_enabled
 from app.models import CachedItem, Library, ServerConnection, User
 from app.plex_client import browse_all_episodes, browse_children, browse_top_level, connect, disable_item_credits, enable_item_credits
 from app.security import get_current_user, get_current_user_via_query
@@ -187,14 +188,8 @@ def set_item_credits(
     if not ok:
         raise HTTPException(status_code=400, detail="This item doesn't expose the credits-generation setting")
 
-    # Keep the cache in sync immediately rather than waiting for the next full Sync — cascades to
-    # every cached descendant (seasons, episodes) too, since they display the same inherited value.
-    db.query(CachedItem).filter_by(server_id=server_id, rating_key=rating_key).update({"credits_enabled": enabled})
-    if item.type == "show":
-        db.query(CachedItem).filter_by(server_id=server_id, show_rating_key=rating_key).update({"credits_enabled": enabled})
-        db.query(CachedItem).filter_by(server_id=server_id, parent_rating_key=rating_key, type="season").update(
-            {"credits_enabled": enabled}
-        )
+    # Keep the cache in sync immediately rather than waiting for the next full Sync.
+    set_cached_credits_enabled(db, server_id, rating_key, enabled)
     db.commit()
 
     return {"rating_key": rating_key, "credits_enabled": enabled}

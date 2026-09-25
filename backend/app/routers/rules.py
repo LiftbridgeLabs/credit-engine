@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.db import get_db
+from app.item_cache import set_cached_credits_enabled
 from app.models import Library, ScanRule, ServerConnection, User
 from app.plex_client import apply_credits_rule, connect
 from app.security import get_current_user
@@ -118,6 +119,10 @@ def apply_rule(
     except Exception as exc:  # noqa: BLE001 — surface whatever plexapi/requests raised as a 400
         raise HTTPException(status_code=400, detail=f"Couldn't apply rule: {exc}")
 
+    for key in result["enabled_keys"]:
+        set_cached_credits_enabled(db, server_id, key, True)
+    for key in result["disabled_keys"]:
+        set_cached_credits_enabled(db, server_id, key, False)
     rule.last_run_at = datetime.now(timezone.utc)
     db.commit()
 

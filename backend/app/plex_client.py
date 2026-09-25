@@ -174,18 +174,24 @@ def apply_credits_rule(plex: PlexServer, section_keys: list[int], criteria: dict
     cutoff = datetime.utcnow() - timedelta(days=criteria["days"])
 
     enabled_titles = []
-    disabled_count = 0
+    enabled_keys = []
+    disabled_keys = []
     for key in section_keys:
         section = plex.library.sectionByID(key)
         for item in section.all():
             if item.lastViewedAt is not None and item.lastViewedAt >= cutoff:
-                enable_item_credits(item)
-                enabled_titles.append(item.title)
-            else:
-                disable_item_credits(item)
-                disabled_count += 1
+                if enable_item_credits(item):
+                    enabled_titles.append(item.title)
+                    enabled_keys.append(item.ratingKey)
+            elif disable_item_credits(item):
+                disabled_keys.append(item.ratingKey)
 
-    return {"enabled": enabled_titles, "disabled_count": disabled_count}
+    return {
+        "enabled": enabled_titles,
+        "enabled_keys": enabled_keys,
+        "disabled_keys": disabled_keys,
+        "disabled_count": len(disabled_keys),
+    }
 
 
 def enable_item_credits(item) -> bool:
