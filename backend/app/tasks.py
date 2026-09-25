@@ -830,10 +830,21 @@ def _build_show_rows(plex, server_id: int, lib: Library, section, cancelled=None
     rows: list[CachedItem] = []
 
     shows = list(section.all(libtype="show"))
-    logger.info("Checking credits status for %d show(s) in %s...", len(shows), lib.title, extra={"server_id": server_id})
+    seasons = list(section.all(libtype="season"))
+    episodes = list(section.all(libtype="episode"))
 
-    # Cheap relative to the episode pass below — one preference read per show, no per-episode
-    # equivalent since Episode doesn't expose the preference at all.
+    # The episode pass is by far the longest part of a sync, so it goes first and the show flags
+    # are read last, just before these rows replace the cached ones. Read first, they were a
+    # snapshot from before that long pass — and anything turned on meanwhile (a watch event, a
+    # toggle) was overwritten back to its old value when the sync finished.
+    logger.info("Checking credits status for %d episode(s) in %s...", len(episodes), lib.title, extra={"server_id": server_id})
+    episode_credits = _credits_by_rating_key(
+        plex, [ep.ratingKey for ep in episodes], "Episodes checked", lib.title, server_id, cancelled
+    )
+
+    logger.info("Checking credits status for %d show(s) in %s...", len(shows), lib.title, extra={"server_id": server_id})
+    # One preference read per show, no per-episode equivalent since Episode doesn't expose the
+    # preference at all.
     with ThreadPoolExecutor(max_workers=_CREDITS_CHECK_WORKERS) as pool:
         enabled_values = _map_with_progress(
             pool, _safe_credits_enabled, shows, "Shows checked", lib.title, server_id, cancelled=cancelled
@@ -853,7 +864,7 @@ def _build_show_rows(plex, server_id: int, lib: Library, section, cancelled=None
                 credits_enabled=show_enabled.get(s.ratingKey),
             )
         )
-    for se in section.all(libtype="season"):
+    for se in seasons:
         rows.append(
             CachedItem(
                 server_id=server_id,
@@ -868,16 +879,7 @@ def _build_show_rows(plex, server_id: int, lib: Library, section, cancelled=None
                 credits_enabled=show_enabled.get(se.parentRatingKey),
             )
         )
-
-    episodes = list(section.all(libtype="episode"))
-    logger.info("Checking credits status for %d episode(s) in %s...", len(episodes), lib.title, extra={"server_id": server_id})
-
-    episode_credits = _credits_by_rating_key(
-        plex, [ep.ratingKey for ep in episodes], "Episodes checked", lib.title, server_id, cancelled
-    )
-
     for ep in episodes:
-        has_credits = episode_credits.get(ep.ratingKey, False)
         rows.append(
             CachedItem(
                 server_id=server_id,
@@ -891,7 +893,7 @@ def _build_show_rows(plex, server_id: int, lib: Library, section, cancelled=None
                 season_number=ep.parentIndex,
                 has_thumb=bool(getattr(ep, "thumb", None)),
                 credits_enabled=show_enabled.get(ep.grandparentRatingKey),
-                has_credits=has_credits,
+                has_credits=episode_credits.get(ep.ratingKey, False),
             )
         )
     return rows
